@@ -1,0 +1,8 @@
+PySide6>=6.5            # Interfaz gráfica
+python-dotenv>=1.0       # Manejo de variables de entorno si necesitas configs
+requests>=2.31           # Para hacer peticiones HTTP si tus nodos interactúan con APIs
+numpy>=1.26              # Si quieres hacer cálculos o manipular datos numéricos
+pandas>=2.1              # Para manejar datos tabulares fácilmente
+networkx>=3.1            # Para representar grafos y conexiones de nodos
+matplotlib>=3.8          # Para visualización de datos o nodos si lo deseas
+pyyaml>=7.0              # Para guardar configuraciones o flujos de nodos en YAML
