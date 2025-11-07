@@ -1,4 +1,5 @@
 from PySide6.QtWidgets import QGraphicsRectItem, QGraphicsTextItem
+from PySide6.QtWidgets import QGraphicsItem
 from PySide6.QtCore import Qt, QRectF, QPointF
 from PySide6.QtGui import QBrush, QColor, QPen, QPainter, QLinearGradient
 
@@ -20,6 +21,12 @@ class GroupItem(QGraphicsRectItem):
             | QGraphicsRectItem.ItemSendsGeometryChanges
         )
         self.setAcceptHoverEvents(True)
+
+        # Cache en coordenadas de dispositivo para mantener bordes nítidos al cambiar zoom
+        try:
+            self.setCacheMode(QGraphicsItem.DeviceCoordinateCache)
+        except Exception:
+            pass
 
         # Calcular rectángulo que englobe miembros con padding
         if not self.members:

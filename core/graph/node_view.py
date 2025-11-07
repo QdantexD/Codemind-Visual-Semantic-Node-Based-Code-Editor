@@ -1,9 +1,14 @@
 from PySide6.QtWidgets import (
-    QGraphicsView, QGraphicsScene, QMenu, QInputDialog, QRubberBand, QApplication, QGraphicsDropShadowEffect, QGraphicsPathItem
+    QGraphicsView, QGraphicsScene, QMenu, QInputDialog, QRubberBand, QApplication, QGraphicsDropShadowEffect, QGraphicsPathItem,
+    QDialog, QVBoxLayout, QHBoxLayout, QLineEdit, QListWidget, QListWidgetItem, QLabel, QWidget, QPushButton
 )
-from PySide6.QtCore import Qt, QRectF, QPointF, Signal, QRect, QSize, QPoint, QTimer
-from PySide6.QtGui import QPainter, QColor, QPen, QCursor, QBrush, QTransform
-import math, logging, os
+from PySide6.QtCore import Qt, QRectF, QPointF, Signal, QRect, QSize, QPoint, QTimer, QStandardPaths
+from PySide6.QtGui import QPainter, QColor, QPen, QCursor, QBrush, QTransform, QIcon, QSurfaceFormat
+try:
+    from PySide6.QtOpenGLWidgets import QOpenGLWidget
+except Exception:
+    QOpenGLWidget = None
+import math, logging, os, hashlib, shutil, difflib
 from .node_item import NodeItem
 from .group_item import GroupItem
 from .connection_item import ConnectionItem
@@ -11,8 +16,12 @@ from .connection_editor import ConnectionEditor
 from ..nodes.variable_node import VariableNode
 from ..library.variable_library import variable_library
 from ..library.cpp_builtins_catalog import get_cpp_catalog
+from ..library.python_node_stdlib import get_python_catalog
+from ..ui.app_icons import make_hat_icon_neon
 from .runtime import GraphRuntime
 from .node_model import NodeModel, project_to_dict, project_from_dict
+from .grid import draw_background_grid
+from .demo_graph import build_demo_graph
 
 logger = logging.getLogger("core.node_view")
 
@@ -49,6 +58,11 @@ class NodeView(QGraphicsView):
         self.setRenderHint(QPainter.Antialiasing, True)
         self.setRenderHint(QPainter.SmoothPixmapTransform, True)
         self.setRenderHint(QPainter.TextAntialiasing, True)
+        # Preferencia de renderizado en GPU (OpenGL) y nivel de MSAA
+        self._gpu_enabled = True
+        self._msaa_samples = 8
+        # Configurar viewport inicial (OpenGL si disponible; fallback a software si falla)
+        self._setup_viewport(enable_gl=self._gpu_enabled)
         # Modo de actualización conservador para evitar repintados reentrantes
         self.setViewportUpdateMode(QGraphicsView.MinimalViewportUpdate)
         # Evitar forzar WA_OpaquePaintEvent que puede chocar con algunos drivers
@@ -62,12 +76,18 @@ class NodeView(QGraphicsView):
         except Exception:
             pass
         self.setOptimizationFlag(QGraphicsView.DontAdjustForAntialiasing, True)
-        # Permitir que Qt gestione el estado del painter para mayor seguridad
-        self.setOptimizationFlag(QGraphicsView.DontSavePainterState, False)
+        # Evitar guardado/restaurado del estado del painter por item para mayor rendimiento
+        # Los items de la escena ya realizan save/restore explícito donde corresponde
+        self.setOptimizationFlag(QGraphicsView.DontSavePainterState, True)
         self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
         # Aceptar arrastrar/soltar (para archivos desde Explorer/OS)
         try:
             self.setAcceptDrops(True)
+            # En QGraphicsView los eventos van al viewport; habilitar también ahí
+            try:
+                self.viewport().setAcceptDrops(True)
+            except Exception:
+                pass
         except Exception:
             pass
         
@@ -109,6 +129,12 @@ class NodeView(QGraphicsView):
         # Efectos en nodos: desactivados por defecto para evitar repintados complejos
         self._node_shadows_enabled = False
 
+        # Estado UX paleta: uso, recientes y favoritos
+        self._palette_usage_counts = {}
+        self._palette_recent = []
+        self._palette_favorites = []
+        self._palette_category_filter = "All"
+
         # Rubber-band
         self._rubber_band = QRubberBand(QRubberBand.Rectangle, self.viewport())
         self._rubber_origin = QPoint()
@@ -132,6 +158,12 @@ class NodeView(QGraphicsView):
         self._undo_stack = []  # lista de tuplas (undo_fn, redo_fn, label)
         self._redo_stack = []
         self._suspend_undo = False  # evita registrar durante ejecución de undo/redo
+
+        # Ajustar hints de render según escala inicial (≈1.0)
+        try:
+            self._apply_dynamic_render_hints(float(self.transform().m11()))
+        except Exception:
+            pass
 
     def _push_undo(self, undo_fn, redo_fn, label: str = ""):
         try:
@@ -204,131 +236,147 @@ class NodeView(QGraphicsView):
             logger.exception("No se pudo inicializar GraphRuntime")
         # (Eliminado: creación duplicada del minimapa)
 
-        # Nodos de ejemplo con tipos y puertos adecuados
+        # Grafo demo delegado al helper para mantener NodeView más ligero
         try:
-            demo_specs = [
-                {"title": "Input", "x": -300, "y": -80, "type": "input", "inputs": [], "outputs": ["output"], "content": "Hola"},
-                {"title": "Process", "x": 40, "y": -20, "type": "process", "inputs": ["input"], "outputs": ["output"], "content": "input.upper()"},
-                {"title": "Output", "x": 320, "y": 70, "type": "output", "inputs": ["input"], "outputs": [], "content": ""},
-            ]
-            created = []
-            for spec in demo_specs:
-                node = self.add_node_with_ports(
-                    title=spec["title"], x=spec["x"], y=spec["y"], node_type=spec["type"],
-                    inputs=spec["inputs"], outputs=spec["outputs"], content=spec.get("content", "")
-                )
-                if node:
-                    created.append(node)
-            # Autoconectar Input -> Process -> Output
-            try:
-                inp = next((n for n in created if getattr(n, 'node_type', '') == 'input'), None)
-                proc = next((n for n in created if getattr(n, 'node_type', '') == 'process'), None)
-                out = next((n for n in created if getattr(n, 'node_type', '') == 'output'), None)
-                if inp and proc:
-                    self.add_connection(inp, proc, start_port=(inp.output_ports[0]['name'] if inp.output_ports else 'output'), end_port=(proc.input_ports[0]['name'] if proc.input_ports else 'input'))
-                if proc and out:
-                    self.add_connection(proc, out, start_port=(proc.output_ports[0]['name'] if proc.output_ports else 'output'), end_port=(out.input_ports[0]['name'] if out.input_ports else 'input'))
-                # Centrar/encuadrar la vista en los nodos creados tras mostrar el widget
-                try:
-                    if created:
-                        def _fit_created():
-                            try:
-                                combined = created[0].sceneBoundingRect()
-                                for it in created[1:]:
-                                    combined = combined.united(it.sceneBoundingRect())
-                                pad = max(60.0, max(combined.width(), combined.height()) * 0.15)
-                                padded = combined.adjusted(-pad, -pad, pad, pad)
-                                old_anchor = self.transformationAnchor()
-                                self.setTransformationAnchor(QGraphicsView.AnchorViewCenter)
-                                self.fitInView(padded, Qt.KeepAspectRatio)
-                                self.setTransformationAnchor(old_anchor)
-                                self._zoom = 0
-                                try:
-                                    self.zoomChanged.emit(float(self.transform().m11()))
-                                except Exception:
-                                    pass
-                            except Exception:
-                                # Fallback simple: centerOn el promedio
-                                try:
-                                    cx = sum(float(n.scenePos().x()) for n in created) / float(len(created))
-                                    cy = sum(float(n.scenePos().y()) for n in created) / float(len(created))
-                                    self.centerOn(QPointF(cx, cy))
-                                except Exception:
-                                    pass
-                        try:
-                            QTimer.singleShot(120, _fit_created)
-                        except Exception:
-                            _fit_created()
-                except Exception:
-                    pass
-            except Exception:
-                pass
-        except Exception as e:
-            logger.warning(f"Error creando nodos de ejemplo: {e}")
-        # Sin child view: el minimapa se dibuja en foreground
+            self.ensure_demo_graph()
+        except Exception:
+            logger.warning("No se pudo crear el grafo demo")
         # Evaluar grafo inicial
         try:
             self.evaluate_graph()
         except Exception as e:
             logger.warning(f"Error evaluando grafo inicial: {e}")
 
-    def ensure_demo_graph(self):
-        """Si la escena está vacía, crea el grafo demo Input->Process->Output y encuadra."""
+    # ----------------------
+    # GPU / OpenGL helpers
+    # ----------------------
+    def _setup_viewport(self, enable_gl: bool = True) -> None:
+        """Configura el viewport.
+
+        Si `enable_gl` es True y hay soporte de OpenGL, usa QOpenGLWidget con
+        MSAA, depth y stencil. En caso de error, cae a QWidget (software).
+        """
         try:
-            existing = [it for it in self._scene.items() if isinstance(it, NodeItem)]
+            if enable_gl and QOpenGLWidget is not None:
+                fmt = QSurfaceFormat()
+                # Perfil core y versión razonable para compatibilidad amplia
+                try:
+                    fmt.setProfile(QSurfaceFormat.CoreProfile)
+                    fmt.setVersion(3, 3)
+                except Exception:
+                    pass
+                # Multisampling y buffers auxiliares para mejor calidad
+                try:
+                    fmt.setSamples(int(max(0, min(int(self._msaa_samples), 16))))
+                except Exception:
+                    fmt.setSamples(8)
+                try:
+                    fmt.setDepthBufferSize(24)
+                    fmt.setStencilBufferSize(8)
+                except Exception:
+                    pass
+                # VSync cuando esté disponible
+                try:
+                    fmt.setSwapInterval(1)
+                except Exception:
+                    pass
+                QSurfaceFormat.setDefaultFormat(fmt)
+                gl = QOpenGLWidget()
+                try:
+                    gl.setFormat(fmt)
+                except Exception:
+                    pass
+                self.setViewport(gl)
+                self._gpu_enabled = True
+                logger.info("Viewport OpenGL activado (MSAA=%d)", getattr(self, "_msaa_samples", 8))
+            else:
+                # Software fallback
+                self.setViewport(QWidget())
+                self._gpu_enabled = False
+                logger.info("Viewport software QWidget activado")
         except Exception:
-            existing = []
-        if existing:
-            return
+            # Si falla cualquier paso, garantizar que haya viewport funcional
+            try:
+                self.setViewport(QWidget())
+            except Exception:
+                pass
+            self._gpu_enabled = False
+            logger.exception("Fallo configurando viewport OpenGL; se usa software.")
+
+    def enable_gpu_rendering(self, enabled: bool) -> None:
+        """Activa o desactiva renderizado con GPU (OpenGL)."""
         try:
-            specs = [
-                {"title": "Input", "x": -300, "y": -80, "type": "input", "inputs": [], "outputs": ["output"], "content": "Hola"},
-                {"title": "Process", "x": 40, "y": -20, "type": "process", "inputs": ["input"], "outputs": ["output"], "content": "input.upper()"},
-                {"title": "Output", "x": 320, "y": 70, "type": "output", "inputs": ["input"], "outputs": [], "content": ""},
-            ]
-            created = []
-            for spec in specs:
-                node = self.add_node_with_ports(
-                    title=spec["title"], x=spec["x"], y=spec["y"], node_type=spec["type"],
-                    inputs=spec["inputs"], outputs=spec["outputs"], content=spec.get("content", ""), record_undo=False
-                )
-                if node:
-                    created.append(node)
-            # Conectar
+            enabled = bool(enabled)
+        except Exception:
+            enabled = True
+        # Reconfigurar viewport sólo si cambia el estado
+        if enabled != bool(getattr(self, "_gpu_enabled", True)):
+            self._gpu_enabled = enabled
+            self._setup_viewport(enable_gl=enabled)
             try:
-                inp = next((n for n in created if getattr(n, 'node_type', '') == 'input'), None)
-                proc = next((n for n in created if getattr(n, 'node_type', '') == 'process'), None)
-                out = next((n for n in created if getattr(n, 'node_type', '') == 'output'), None)
-                if inp and proc:
-                    self.add_connection(inp, proc, start_port=(inp.output_ports[0]['name'] if inp.output_ports else 'output'), end_port=(proc.input_ports[0]['name'] if proc.input_ports else 'input'), record_undo=False)
-                if proc and out:
-                    self.add_connection(proc, out, start_port=(proc.output_ports[0]['name'] if proc.output_ports else 'output'), end_port=(out.input_ports[0]['name'] if out.input_ports else 'input'), record_undo=False)
+                self.viewport().update()
             except Exception:
                 pass
-            # Encadrar
-            try:
-                if created:
-                    combined = created[0].sceneBoundingRect()
-                    for it in created[1:]:
-                        combined = combined.united(it.sceneBoundingRect())
-                    pad = max(60.0, max(combined.width(), combined.height()) * 0.15)
-                    padded = combined.adjusted(-pad, -pad, pad, pad)
-                    old_anchor = self.transformationAnchor()
-                    self.setTransformationAnchor(QGraphicsView.AnchorViewCenter)
-                    self.fitInView(padded, Qt.KeepAspectRatio)
-                    self.setTransformationAnchor(old_anchor)
-                    self._zoom = 0
-                    try:
-                        self.zoomChanged.emit(float(self.transform().m11()))
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-            # Evaluar
-            try:
-                self.evaluate_graph()
-            except Exception:
-                pass
+
+    def set_msaa_samples(self, samples: int) -> None:
+        """Ajusta el nivel de MSAA y reconfigura el viewport si está en GPU."""
+        try:
+            s = int(samples)
+        except Exception:
+            s = 8
+        s = max(0, min(s, 16))
+        if s == getattr(self, "_msaa_samples", 8):
+            return
+        self._msaa_samples = s
+        # Si estamos en GPU, volver a crear el viewport para aplicar formato
+        if isinstance(self.viewport(), QOpenGLWidget):
+            self._setup_viewport(enable_gl=True)
+
+    def is_gpu_active(self) -> bool:
+        """Indica si el viewport actual usa QOpenGLWidget (GPU)."""
+        try:
+            return isinstance(self.viewport(), QOpenGLWidget)
+        except Exception:
+            return False
+
+    def _apply_dynamic_render_hints(self, scale_x: float) -> None:
+        """Ajusta hints de render en función de la escala para equilibrar calidad/rendimiento.
+
+        - Escala baja (<0.65): desactiva antialiasing y suavizado de pixmaps.
+        - Escala media (0.65–1.25): antialiasing básico y text antialiasing.
+        - Escala alta (>1.25): antialiasing y suavizado de pixmaps completos.
+        """
+        try:
+            s = float(scale_x)
+        except Exception:
+            s = 1.0
+        try:
+            if s < 0.65:
+                self.setRenderHint(QPainter.Antialiasing, False)
+                self.setRenderHint(QPainter.HighQualityAntialiasing, False)
+                self.setRenderHint(QPainter.SmoothPixmapTransform, False)
+                self.setRenderHint(QPainter.TextAntialiasing, False)
+            elif s <= 1.25:
+                self.setRenderHint(QPainter.Antialiasing, True)
+                self.setRenderHint(QPainter.HighQualityAntialiasing, False)
+                self.setRenderHint(QPainter.SmoothPixmapTransform, True)
+                self.setRenderHint(QPainter.TextAntialiasing, True)
+            else:
+                self.setRenderHint(QPainter.Antialiasing, True)
+                # Alta calidad sólo en grandes ampliaciones
+                try:
+                    self.setRenderHint(QPainter.HighQualityAntialiasing, True)
+                except Exception:
+                    pass
+                self.setRenderHint(QPainter.SmoothPixmapTransform, True)
+                self.setRenderHint(QPainter.TextAntialiasing, True)
+        except Exception:
+            pass
+
+    def ensure_demo_graph(self):
+        """Si la escena está vacía, delega la creación del grafo demo."""
+        try:
+            build_demo_graph(self)
         except Exception:
             logger.exception("No se pudo asegurar el grafo demo")
 
@@ -350,35 +398,25 @@ class NodeView(QGraphicsView):
                 self._major_factor = 4
         except Exception:
             pass
-        painter.fillRect(rect, self._bg_color)
-        grid = float(self._base_grid)
-        major = self._major_factor
-
-        left = math.floor(rect.left() / grid) * grid
-        top = math.floor(rect.top() / grid) * grid
-        right = rect.right()
-        bottom = rect.bottom()
-
-        fine_pen = QPen(self._grid_color)
-        fine_pen.setWidthF(0.0)
-        major_pen = QPen(self._major_grid_color)
-        major_pen.setWidthF(0.0)
-
-        # Líneas verticales
-        x, i = left, 0
-        while x <= right:
-            painter.setPen(major_pen if i % major == 0 else fine_pen)
-            painter.drawLine(QPointF(x + 0.5, top), QPointF(x + 0.5, bottom))
-            x += grid
-            i += 1
-
-        # Líneas horizontales
-        y, i = top, 0
-        while y <= bottom:
-            painter.setPen(major_pen if i % major == 0 else fine_pen)
-            painter.drawLine(QPointF(left, y + 0.5), QPointF(right, y + 0.5))
-            y += grid
-            i += 1
+        # Delegar a util para mantener NodeView más simple, con clipping para reducir overdraw
+        try:
+            painter.save()
+            painter.setClipRect(rect)
+        except Exception:
+            pass
+        draw_background_grid(
+            painter,
+            rect,
+            self._bg_color,
+            self._grid_color,
+            self._major_grid_color,
+            float(self._base_grid),
+            int(self._major_factor),
+        )
+        try:
+            painter.restore()
+        except Exception:
+            pass
 
     # ----------------------
     # Selection Handling
@@ -396,7 +434,9 @@ class NodeView(QGraphicsView):
     # Zoom
     # ----------------------
     def wheelEvent(self, event):
-        if event.modifiers() & Qt.ControlModifier:
+        # Permitir zoom con rueda incluso sin Ctrl (comportamiento configurable)
+        requires_ctrl = getattr(self, "_wheel_zoom_requires_ctrl", False)
+        if (requires_ctrl and (event.modifiers() & Qt.ControlModifier)) or (not requires_ctrl):
             factor = 1.25 if event.angleDelta().y() > 0 else 1 / 1.25
             new_zoom = self._zoom + (1 if event.angleDelta().y() > 0 else -1)
             if -40 <= new_zoom <= 80:
@@ -406,6 +446,23 @@ class NodeView(QGraphicsView):
                 try:
                     scale_x = float(self.transform().m11())
                     self.zoomChanged.emit(scale_x)
+                    # Ajustar hints de render dinámicamente según escala
+                    try:
+                        self._apply_dynamic_render_hints(scale_x)
+                    except Exception:
+                        pass
+                    # Aplicar comportamiento adaptativo de textos en nodos
+                    try:
+                        for it in self._scene.items():
+                            if isinstance(it, NodeItem):
+                                it.apply_adaptive_text_behavior(scale_x)
+                    except Exception:
+                        pass
+                    # Log de diagnóstico para comprobar escala efectiva de la vista
+                    try:
+                        print(f"[NodeView] scale_x={scale_x:.3f}")
+                    except Exception:
+                        pass
                 except Exception:
                     pass
                 try:
@@ -1159,7 +1216,7 @@ class NodeView(QGraphicsView):
             pass
 
     # ----------------------
-    # Node Creation (Tab Menu)
+    # Node Creation (Palette)
     # ----------------------
     def keyPressEvent(self, event):
         # Undo/Redo por teclado
@@ -1175,14 +1232,21 @@ class NodeView(QGraphicsView):
                     return
         except Exception:
             pass
-        if event.key() == Qt.Key_Tab:
-            # Abrir menú TAB de creación de nodos
+        # Abrir paleta de nodos con tecla 'R' (antes TAB)
+        if event.key() == Qt.Key_R or (event.modifiers() & Qt.ControlModifier and event.key() == Qt.Key_K) or (event.key() == Qt.Key_Slash):
+            # Abrir paleta estilo Houdini con filtro
             try:
-                self._show_tab_menu()
+                self._show_tab_palette()
                 event.accept()
                 return
             except Exception:
-                pass
+                # Fallback al menú clásico si la paleta falla
+                try:
+                    self._show_tab_menu()
+                    event.accept()
+                    return
+                except Exception:
+                    pass
             super().keyPressEvent(event)
             return
         # Alternar minimapa con 'N'
@@ -1304,9 +1368,558 @@ class NodeView(QGraphicsView):
     # API pública para abrir el menú TAB desde otras vistas (barra inferior)
     def open_tab_menu(self):
         try:
-            self._show_tab_menu()
+            self._show_tab_palette()
         except Exception:
             pass
+
+    def _show_tab_palette(self):
+        """Muestra una paleta flotante con filtro al estilo Houdini para crear nodos.
+        Estética mejorada: panel oscuro elegante con esquinas redondeadas, sombra y cierre
+        automático al hacer clic fuera.
+        """
+        # Posición en escena anclada al cursor o centro del viewport
+        view_pos = self.mapFromGlobal(QCursor.pos())
+        try:
+            vp_rect = self.viewport().rect()
+            if not vp_rect.contains(view_pos):
+                view_pos = vp_rect.center()
+        except Exception:
+            pass
+        scene_pos = self.mapToScene(view_pos)
+
+        # Construir catálogo con metadatos (nombre, fn, categoría, tags, descripción, icono)
+        items = []
+        def add_item(name, fn, category="All", tags=None, description="", icon_name=None):
+            items.append({
+                "name": name,
+                "fn": fn,
+                "category": category,
+                "tags": tags or [],
+                "description": description or name,
+                "icon_name": icon_name,
+            })
+
+        # Base de blueprint
+        add_item("Event", lambda pos: self.add_node_with_ports(
+            title="Event", x=pos.x(), y=pos.y(), node_type="event",
+            inputs=[], outputs=[{"name": "exec", "kind": "exec"}], content="// Evento base"),
+            category="Blueprint", tags=["exec","flow"], description="Nodo de evento base", icon_name="media-playback-start")
+        add_item("Branch", lambda pos: self.add_node_with_ports(
+            title="Branch", x=pos.x(), y=pos.y(), node_type="branch",
+            inputs=[{"name": "exec", "kind": "exec"}, {"name": "condition"}],
+            outputs=[{"name": "true", "kind": "exec"}, {"name": "false", "kind": "exec"}], content="// Branch"),
+            category="Blueprint", tags=["exec","flow"], description="Condicional tipo Branch", icon_name="view-sort-ascending")
+        add_item("Sequence", lambda pos: self.add_node_with_ports(
+            title="Sequence", x=pos.x(), y=pos.y(), node_type="sequence",
+            inputs=[{"name": "exec", "kind": "exec"}],
+            outputs=[{"name": "A", "kind": "exec"}, {"name": "B", "kind": "exec"}], content="// Sequence"),
+            category="Blueprint", tags=["exec","flow"], description="Secuencia de ejecución", icon_name="view-list")
+        add_item("Print", lambda pos: self.add_node_with_ports(
+            title="Print", x=pos.x(), y=pos.y(), node_type="print",
+            inputs=[{"name": "exec", "kind": "exec"}, {"name": "input"}],
+            outputs=[{"name": "then", "kind": "exec"}], content="print(input)"),
+            category="Blueprint", tags=["text","exec"], description="Imprime y continúa", icon_name="document-print")
+
+        # Nodos básicos
+        add_item("Input", lambda pos: self.add_node_with_ports(
+            title="Input", x=pos.x(), y=pos.y(), node_type="input",
+            inputs=[], outputs=[{"name": "output", "kind": "data"}], content=""),
+            category="Input", tags=["io","data"], description="Fuente de datos", icon_name="go-up")
+        # Estilo tipo Blender/Houdini: Group Input/Output
+        add_item("Group Input", lambda pos: self.add_node_with_ports(
+            title="Group Input", x=pos.x(), y=pos.y(), node_type="group_input",
+            inputs=[], outputs=[{"name": "Geometry", "kind": "data"}], content=""),
+            category="IO", tags=["group","io"], description="Entrada del grupo (Geometry)", icon_name="go-up")
+        add_item("Process", lambda pos: self.add_node_with_ports(
+            title="Process", x=pos.x(), y=pos.y(), node_type="process",
+            inputs=[{"name": "input", "kind": "data"}], outputs=[{"name": "output", "kind": "data"}], content="input"),
+            category="Process", tags=["process"], description="Transforma datos", icon_name="applications-system")
+        add_item("Output", lambda pos: self.add_node_with_ports(
+            title="Output", x=pos.x(), y=pos.y(), node_type="output",
+            inputs=[{"name": "input", "kind": "data"}], outputs=[], content=""),
+            category="IO", tags=["io"], description="Sumidero de datos", icon_name="go-down")
+        add_item("Group Output", lambda pos: self.add_node_with_ports(
+            title="Group Output", x=pos.x(), y=pos.y(), node_type="group_output",
+            inputs=[{"name": "Geometry", "kind": "data"}], outputs=[], content=""),
+            category="IO", tags=["group","io"], description="Salida del grupo (Geometry)", icon_name="go-down")
+        add_item("Variable", lambda pos: self.add_node_with_ports(
+            title="Variable", x=pos.x(), y=pos.y(), node_type="variable",
+            inputs=[{"name": "set"}], outputs=[{"name": "output"}], content=""),
+            category="Input", tags=["data"], description="Nodo de variable", icon_name="tag")
+        add_item("Generic", lambda pos: self.add_node_with_ports(
+            title="Node", x=pos.x(), y=pos.y(), node_type="generic",
+            inputs=["input"], outputs=["output"], content=""),
+            category="Process", tags=["generic"], description="Nodo genérico", icon_name="applications-other")
+
+        # Catálogo C++ como entradas planas
+        try:
+            catalog = get_cpp_catalog() or {}
+        except Exception:
+            catalog = {}
+        for category, cat_items in catalog.items():
+            for it in cat_items:
+                label = f"C++: {it.get('name', '(símbolo)')}"
+                def make_cpp_fn(item):
+                    return lambda pos: self._create_node_from_cpp_catalog_item(item, pos)
+                add_item(label, make_cpp_fn(it), category="C++", tags=[category], description=f"Símbolo C++: {label}", icon_name="applications-development")
+        # Acciones múltiples C++
+        add_item("C++: Definiciones múltiples", lambda pos: self._wrap_multi_cpp(self._generate_cpp_definitions_nodes, pos), category="C++", tags=["bulk"], description="Genera varios nodos de definiciones")
+        add_item("C++: Clases múltiples", lambda pos: self._wrap_multi_cpp(self._generate_cpp_classes_nodes, pos), category="C++", tags=["bulk"], description="Genera varios nodos de clases")
+
+        # Catálogo Python como entradas planas
+        try:
+            py_catalog = get_python_catalog() or {}
+        except Exception:
+            py_catalog = {}
+        for category, cat_items in py_catalog.items():
+            for it in cat_items:
+                py_label = f"Python: {it.get('name', '(snippet)')}"
+                def make_py_fn(item):
+                    return lambda pos: self._create_node_from_python_catalog_item(item, pos)
+                add_item(py_label, make_py_fn(it), category="Python", tags=[category], description=it.get("description", py_label), icon_name="application-python")
+
+        # Diálogo estilizado tipo popup (cierra al hacer clic fuera)
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Crear nodo")
+        try:
+            dlg.setAttribute(Qt.WA_TranslucentBackground, True)
+            dlg.setWindowFlags(Qt.Popup | Qt.FramelessWindowHint)
+        except Exception:
+            pass
+
+        # Contenedor con estilo (bordes redondeados + sombra)
+        root = QVBoxLayout(dlg)
+        root.setContentsMargins(0, 0, 0, 0)
+        container = QWidget(dlg)
+        container.setObjectName("tabPaletteContainer")
+        container.setStyleSheet(
+            "#tabPaletteContainer {"
+            "  background-color: #0f1116;"
+            "  border: 1px solid #2a2e36;"
+            "  border-radius: 10px;"
+            "}"
+        )
+        shadow = QGraphicsDropShadowEffect(container)
+        try:
+            shadow.setBlurRadius(24)
+            shadow.setOffset(0, 6)
+            shadow.setColor(QColor(0, 0, 0, 120))
+            container.setGraphicsEffect(shadow)
+        except Exception:
+            pass
+        root.addWidget(container)
+
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
+        lbl = QLabel("Escribe para filtrar…")
+        try:
+            lbl.setStyleSheet("color: #a1a7b3; font-size: 11px;")
+        except Exception:
+            pass
+        layout.addWidget(lbl)
+
+        # Chips de categoría
+        chip_bar = QHBoxLayout()
+        chip_bar.setSpacing(6)
+        chip_names = ["All", "Input", "Process", "IO", "Visual", "Blueprint", "Python", "C++", "Recientes", "Favoritos"]
+        chip_buttons = {}
+        for name in chip_names:
+            b = QPushButton(name)
+            b.setCheckable(True)
+            b.setStyleSheet(
+                "QPushButton {"
+                "  background-color: #111827; border: 1px solid #253044;"
+                "  border-radius: 10px; padding: 4px 8px; color: #cbd5e1; font-size: 11px;"
+                "}"
+                "QPushButton:hover { background-color: #172036; }"
+                "QPushButton:checked { background-color: #2563eb; color: #ffffff; border-color: #2563eb; }"
+            )
+            # Icono distintivo para Python y C++ (SVG propio para nitidez y estabilidad)
+            try:
+                if name == "Python":
+                    root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+                    svg_py = os.path.join(root, "assets", "icons", "python.svg")
+                    icon = QIcon(svg_py) if os.path.exists(svg_py) else QIcon.fromTheme("application-python")
+                    if not icon or icon.isNull():
+                        icon = make_hat_icon_neon(size=24, color="lime")
+                    b.setIcon(icon)
+                elif name == "C++":
+                    root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+                    svg_cpp = os.path.join(root, "assets", "icons", "cplusplus.svg")
+                    icon = QIcon(svg_cpp) if os.path.exists(svg_cpp) else QIcon.fromTheme("applications-development")
+                    b.setIcon(icon if icon and not icon.isNull() else QIcon())
+            except Exception:
+                pass
+            chip_bar.addWidget(b)
+            chip_buttons[name] = b
+        layout.addLayout(chip_bar)
+
+        edit = QLineEdit()
+        edit.setPlaceholderText("Buscar nodo (R)")
+        try:
+            edit.setStyleSheet(
+                "QLineEdit {"
+                "  background-color: #141820;"
+                "  border: 1px solid #2f3640;"
+                "  border-radius: 8px;"
+                "  padding: 8px;"
+                "  color: #e6edf3;"
+                "  selection-background-color: #2563eb;"
+                "  selection-color: #ffffff;"
+                "}"
+                "QLineEdit:focus {"
+                "  border-color: #3b82f6;"
+                "  background-color: #0f172a;"
+                "}"
+            )
+        except Exception:
+            pass
+        layout.addWidget(edit)
+
+        listw = QListWidget()
+        try:
+            listw.setStyleSheet(
+                "QListWidget {"
+                "  background-color: #0b0e14;"
+                "  border: 1px solid #22262e;"
+                "  border-radius: 8px;"
+                "  padding: 4px;"
+                "  color: #e5e7eb;"
+                "}"
+                "QListWidget::item {"
+                "  padding: 6px 8px;"
+                "}"
+                "QListWidget::item:selected {"
+                "  background-color: #2563eb;"
+                "  color: #ffffff;"
+                "  border-radius: 6px;"
+                "}"
+                "QListWidget::item:hover {"
+                "  background-color: #1f2937;"
+                "  color: #e5e7eb;"
+                "}"
+            )
+        except Exception:
+            pass
+        listw.setMinimumWidth(280)
+        listw.setMinimumHeight(220)
+        layout.addWidget(listw)
+
+        # Helpers de ranking y filtro
+        def _recent_rank(name: str) -> int:
+            try:
+                idx = self._palette_recent.index(name)
+                return max(0, len(self._palette_recent) - idx)
+            except Exception:
+                return 0
+
+        def _score(query: str, item: dict):
+            name = item.get("name", "").lower()
+            if not query:
+                return (_recent_rank(item.get("name", "")) + self._palette_usage_counts.get(item.get("name", ""), 0), 1.0)
+            q = query.lower()
+            exact = 1 if name == q else 0
+            starts = 1 if name.startswith(q) else 0
+            contains = 1 if q in name else 0
+            fuzzy = 0.0
+            try:
+                fuzzy = difflib.SequenceMatcher(None, q, name).ratio()
+            except Exception:
+                fuzzy = 0.0
+            return (
+                exact * 100 + starts * 50 + contains * 25 + _recent_rank(item.get("name", "")) * 10 + self._palette_usage_counts.get(item.get("name", ""), 0),
+                fuzzy
+            )
+
+        # Estado de acción al aceptar
+        action_mode = {"mode": "insert"}
+
+        # Debounce de búsqueda
+        search_timer = QTimer(dlg)
+        search_timer.setSingleShot(True)
+        search_timer.setInterval(150)
+
+        # Población inicial con filtros y ranking
+        def populate(filter_text: str = ""):
+            listw.clear()
+            f = (filter_text or "").strip()
+            cat = getattr(self, "_palette_category_filter", "All") or "All"
+
+            # Tags en query: palabras que comienzan por '#'
+            tag_filters = []
+            if f:
+                try:
+                    tag_filters = [t[1:].lower() for t in f.split() if t.startswith('#') and len(t) > 1]
+                except Exception:
+                    tag_filters = []
+            plain_query = ' '.join([w for w in f.split() if not w.startswith('#')])
+
+            # Filtrar por categoría o recientes/favoritos
+            candidates = []
+            if cat == "Recientes":
+                recent_set = set(self._palette_recent or [])
+                for it in items:
+                    if it.get("name") in recent_set:
+                        candidates.append(it)
+            elif cat == "Favoritos":
+                fav_set = set(self._palette_favorites or [])
+                for it in items:
+                    if it.get("name") in fav_set:
+                        candidates.append(it)
+            elif cat == "All":
+                candidates = list(items)
+            else:
+                internal_cat = "Blueprint" if cat == "Visual" else cat
+                candidates = [it for it in items if it.get("category") == internal_cat]
+
+            # Filtrar por tags (AND)
+            if tag_filters:
+                candidates = [it for it in candidates if set(tag_filters).issubset(set([t.lower() for t in it.get("tags", [])]))]
+
+            # Ordenar por score (coincidencia → recientes → uso → fuzzy)
+            scored = []
+            for it in candidates:
+                s1, s2 = _score(plain_query, it)
+                scored.append((s1, s2, it))
+            scored.sort(key=lambda t: (t[0], t[1]), reverse=True)
+
+            # Poblar lista con iconos y tooltips
+            for _, _, it in scored:
+                name = it.get("name", "")
+                qicon = None
+                try:
+                    icon_name = it.get("icon_name")
+                    if icon_name:
+                        # Usar SVG propio para Python para máxima nitidez
+                        if icon_name == "application-python":
+                            root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+                            svg_py = os.path.join(root, "assets", "icons", "python.svg")
+                            if os.path.exists(svg_py):
+                                qicon = QIcon(svg_py)
+                            else:
+                                qicon = QIcon.fromTheme(icon_name)
+                            if not qicon or qicon.isNull():
+                                try:
+                                    qicon = make_hat_icon_neon(size=24, color="lime")
+                                except Exception:
+                                    qicon = QIcon()
+                        else:
+                            qicon = QIcon.fromTheme(icon_name)
+                except Exception:
+                    qicon = None
+                is_fav = name in (self._palette_favorites or [])
+                display_name = ("★ " + name) if is_fav else name
+                itemw = QListWidgetItem(qicon if qicon else QIcon(), display_name)
+                usage = self._palette_usage_counts.get(name, 0)
+                recent_lbl = " • reciente" if name in (self._palette_recent or []) else ""
+                fav_lbl = " • favorito" if is_fav else ""
+                itemw.setToolTip(f"{it.get('description', name)}{recent_lbl}{fav_lbl} • usados: {usage}")
+                itemw.setData(Qt.UserRole, it)
+                listw.addItem(itemw)
+
+        populate()
+
+        def _update_usage_and_recents(name: str):
+            try:
+                self._palette_usage_counts[name] = int(self._palette_usage_counts.get(name, 0)) + 1
+            except Exception:
+                pass
+            try:
+                # Mover a la cabecera de "recientes"
+                self._palette_recent = [n for n in (self._palette_recent or []) if n != name]
+                self._palette_recent.insert(0, name)
+                # Limitar longitud
+                if len(self._palette_recent) > 24:
+                    self._palette_recent = self._palette_recent[:24]
+            except Exception:
+                pass
+
+        def _create_selected(auto_connect: bool = False, open_inspector: bool = False, keep_open: bool = False):
+            it = listw.currentItem() or (listw.item(0) if listw.count() > 0 else None)
+            if it is None:
+                if not keep_open:
+                    dlg.reject()
+                return
+            meta = it.data(Qt.UserRole) or {}
+            fn = meta.get("fn")
+            name = meta.get("name", "")
+            # Recordar selección previa para autoconexión
+            selected_before = [n for n in self._scene.selectedItems() if isinstance(n, NodeItem)]
+            try:
+                node = fn(scene_pos) if callable(fn) else None
+            except Exception:
+                node = None
+                logger.exception("No se pudo crear nodo desde paleta TAB")
+            if node:
+                try:
+                    for sel in self._scene.selectedItems():
+                        sel.setSelected(False)
+                    node.setSelected(True)
+                    self.centerOn(node)
+                except Exception:
+                    pass
+                _update_usage_and_recents(name)
+                # Autoconectar con un único nodo previamente seleccionado
+                if auto_connect:
+                    try:
+                        if len(selected_before) == 1:
+                            src = selected_before[0]
+                            # Elegir puertos razonables
+                            start_item = src
+                            end_item = node
+                            start_port = (src.output_ports[0]['name'] if getattr(src, 'output_ports', None) else 'output')
+                            end_port = (node.input_ports[0]['name'] if getattr(node, 'input_ports', None) else 'input')
+                            # Si el seleccionado no tiene OUT pero sí IN, invertir dirección
+                            if not getattr(src, 'output_ports', None):
+                                start_item = node
+                                end_item = src
+                                start_port = (node.output_ports[0]['name'] if getattr(node, 'output_ports', None) else 'output')
+                                end_port = (src.input_ports[0]['name'] if getattr(src, 'input_ports', None) else 'input')
+                            self.add_connection(start_item, end_item, start_port=start_port, end_port=end_port)
+                    except Exception:
+                        logger.exception("Autoconexión fallida tras inserción")
+                # Abrir inspector si se solicita
+                if open_inspector:
+                    try:
+                        self.editNodeRequested.emit(node)
+                    except Exception:
+                        pass
+            if not keep_open:
+                dlg.accept()
+
+        def accept_selected():
+            _create_selected(auto_connect=False, open_inspector=False, keep_open=False)
+
+        # Búsqueda con debounce y typeahead
+        def _on_text_changed(_t):
+            try:
+                search_timer.stop()
+            except Exception:
+                pass
+            try:
+                search_timer.start()
+            except Exception:
+                pass
+        def _on_search_timeout():
+            try:
+                populate(edit.text())
+            except Exception:
+                pass
+        edit.textChanged.connect(_on_text_changed)
+        search_timer.timeout.connect(_on_search_timeout)
+        edit.returnPressed.connect(accept_selected)
+        # Navegación desde el campo de búsqueda
+        orig_edit_kp = edit.keyPressEvent
+        def _edit_keypress(e):
+            try:
+                if e.key() == Qt.Key_Down:
+                    row = max(0, listw.currentRow())
+                    listw.setCurrentRow(min(row + 1, listw.count() - 1))
+                    e.accept(); return
+                if e.key() == Qt.Key_Up:
+                    row = max(0, listw.currentRow())
+                    listw.setCurrentRow(max(row - 1, 0))
+                    e.accept(); return
+                if e.key() in (Qt.Key_Escape,):
+                    dlg.close(); e.accept(); return
+                if e.key() in (Qt.Key_Return, Qt.Key_Enter):
+                    accept_selected(); e.accept(); return
+                if e.key() == Qt.Key_Tab:
+                    _create_selected(auto_connect=False, open_inspector=False, keep_open=True); e.accept(); return
+                if (e.modifiers() & Qt.ControlModifier) and e.key() in (Qt.Key_Return, Qt.Key_Enter):
+                    _create_selected(auto_connect=True, open_inspector=False, keep_open=False); e.accept(); return
+                if (e.modifiers() & Qt.ShiftModifier) and e.key() in (Qt.Key_Return, Qt.Key_Enter):
+                    _create_selected(auto_connect=False, open_inspector=True, keep_open=False); e.accept(); return
+            except Exception:
+                pass
+            orig_edit_kp(e)
+        edit.keyPressEvent = _edit_keypress
+
+        # Cerrar también con ESC desde la lista
+        orig_list_kp = listw.keyPressEvent
+        def _list_keypress(e):
+            try:
+                if e.key() == Qt.Key_Escape:
+                    dlg.close(); e.accept(); return
+                if e.key() == Qt.Key_F:
+                    # Alternar favorito del elemento actual
+                    it = listw.currentItem()
+                    if it is not None:
+                        meta = it.data(Qt.UserRole) or {}
+                        name = meta.get('name', '')
+                        try:
+                            favs = set(self._palette_favorites or [])
+                            if name in favs:
+                                favs.remove(name)
+                            else:
+                                favs.add(name)
+                            self._palette_favorites = list(favs)
+                        except Exception:
+                            pass
+                        # Refrescar manteniendo el texto
+                        populate(edit.text())
+                    e.accept(); return
+                if e.key() == Qt.Key_Tab:
+                    _create_selected(auto_connect=False, open_inspector=False, keep_open=True); e.accept(); return
+                if (e.modifiers() & Qt.ControlModifier) and e.key() in (Qt.Key_Return, Qt.Key_Enter):
+                    _create_selected(auto_connect=True, open_inspector=False, keep_open=False); e.accept(); return
+                if (e.modifiers() & Qt.ShiftModifier) and e.key() in (Qt.Key_Return, Qt.Key_Enter):
+                    _create_selected(auto_connect=False, open_inspector=True, keep_open=False); e.accept(); return
+                if e.key() in (Qt.Key_Return, Qt.Key_Enter):
+                    accept_selected(); e.accept(); return
+            except Exception:
+                pass
+            orig_list_kp(e)
+        listw.keyPressEvent = _list_keypress
+        listw.itemActivated.connect(lambda *_: accept_selected())
+
+        # Comportamiento de chips de categoría
+        def _set_active_chip(cat_name: str):
+            try:
+                for nm, btn in chip_buttons.items():
+                    btn.setChecked(nm == cat_name)
+                setattr(self, '_palette_category_filter', cat_name)
+            except Exception:
+                setattr(self, '_palette_category_filter', cat_name)
+            populate(edit.text())
+        # Seleccionar "All" por defecto
+        try:
+            chip_buttons.get("All").setChecked(True)
+        except Exception:
+            pass
+        for nm, btn in chip_buttons.items():
+            try:
+                btn.clicked.connect(lambda checked=False, name=nm: _set_active_chip(name))
+            except Exception:
+                pass
+
+        # Posicionar cerca del cursor
+        try:
+            dlg.move(QCursor.pos())
+        except Exception:
+            pass
+        edit.setFocus()
+        # Mostrar como popup (se cierra al hacer clic fuera)
+        try:
+            dlg.show()
+        except Exception:
+            # Fallback a exec si show falla (sin cierre automático)
+            dlg.exec()
+
+    def _wrap_multi_cpp(self, fn, pos: QPointF):
+        try:
+            created = fn(var_node=None, scene_pos=pos)
+            if created:
+                for it in self._scene.selectedItems():
+                    it.setSelected(False)
+                created[0].setSelected(True)
+                self.centerOn(created[0])
+            return None
+        except Exception:
+            logger.exception("No se pudieron generar nodos C++ múltiples desde paleta TAB")
+            return None
 
     # Controles de zoom para la barra inferior del editor de nodos
     def zoom_in(self):
@@ -1317,7 +1930,14 @@ class NodeView(QGraphicsView):
                 self._zoom = new_zoom
                 self.scale(factor, factor)
                 try:
-                    self.zoomChanged.emit(float(self.transform().m11()))
+                    scale_x = float(self.transform().m11())
+                    self.zoomChanged.emit(scale_x)
+                    try:
+                        for it in self._scene.items():
+                            if isinstance(it, NodeItem):
+                                it.apply_adaptive_text_behavior(scale_x)
+                    except Exception:
+                        pass
                 except Exception:
                     pass
                 try:
@@ -1335,7 +1955,14 @@ class NodeView(QGraphicsView):
                 self._zoom = new_zoom
                 self.scale(factor, factor)
                 try:
-                    self.zoomChanged.emit(float(self.transform().m11()))
+                    scale_x = float(self.transform().m11())
+                    self.zoomChanged.emit(scale_x)
+                    try:
+                        for it in self._scene.items():
+                            if isinstance(it, NodeItem):
+                                it.apply_adaptive_text_behavior(scale_x)
+                    except Exception:
+                        pass
                 except Exception:
                     pass
                 try:
@@ -1350,7 +1977,14 @@ class NodeView(QGraphicsView):
             self.resetTransform()
             self._zoom = 0
             try:
-                self.zoomChanged.emit(float(self.transform().m11()))
+                scale_x = float(self.transform().m11())
+                self.zoomChanged.emit(scale_x)
+                try:
+                    for it in self._scene.items():
+                        if isinstance(it, NodeItem):
+                            it.apply_adaptive_text_behavior(scale_x)
+                except Exception:
+                    pass
             except Exception:
                 pass
             try:
@@ -1653,11 +2287,60 @@ class NodeView(QGraphicsView):
 
             # Título genérico para consistencia y mejores guías
             node = self.add_node(title="Código C++", x=float(scene_pos.x()), y=float(scene_pos.y()), node_type="generic", content=cpp_code)
+            # Identidad visual del nodo C++ (icono y lenguaje)
+            try:
+                node._language = "cpp"
+                root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+                svg_cpp = os.path.join(root, "assets", "icons", "cplusplus.svg")
+                icon = QIcon(svg_cpp) if os.path.exists(svg_cpp) else QIcon.fromTheme("applications-development")
+                node.header_icon = icon if icon and not icon.isNull() else QIcon()
+            except Exception:
+                pass
             return node
         except Exception:
             logger.exception("Error creando nodo desde catálogo C++")
             return None
 
+    def _create_node_from_python_catalog_item(self, item: dict, scene_pos: QPointF):
+        """Crea un nodo Process con el snippet/plantilla del catálogo Python."""
+        try:
+            name = item.get("name", "Snippet Python")
+            template = item.get("template", "output = input")
+            desc = item.get("description", "Python")
+
+            # Asegurar sugerencias de variables para Python en otros flujos
+            try:
+                variable_library.current_language = "python"
+            except Exception:
+                pass
+
+            banner = f"# Catálogo Python — {name}\n# {desc}\n\n"
+            content = banner + template
+
+            node = self.add_node_with_ports(
+                title="Process",
+                x=float(scene_pos.x()),
+                y=float(scene_pos.y()),
+                node_type="process",
+                inputs=[{"name": "input", "kind": "data"}],
+                outputs=[{"name": "output", "kind": "data"}],
+                content=content,
+            )
+            # Identidad visual del nodo Python (icono y lenguaje)
+            try:
+                node._language = "python"
+                root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+                svg_py = os.path.join(root, "assets", "icons", "python.svg")
+                icon = QIcon(svg_py) if os.path.exists(svg_py) else QIcon.fromTheme("application-python")
+                if not icon or icon.isNull():
+                    icon = make_hat_icon_neon(size=24, color="lime")
+                node.header_icon = icon
+            except Exception:
+                pass
+            return node
+        except Exception:
+            logger.exception("Error creando nodo desde catálogo Python")
+            return None
     def _generate_single_classic_variable(self, language_key: str, scene_pos):
         """Genera un único VariableNode con el primer tipo/nombre sugerido del lenguaje."""
         try:
@@ -1881,6 +2564,9 @@ class NodeView(QGraphicsView):
         menu.addAction("Crear nodo Monitor (Output)")
         # Output Global: agrega un Output con múltiples IN y autoconecta fuentes
         menu.addAction("Crear Output Global (autoconectar)")
+        # Utilidades
+        menu.addSeparator()
+        menu.addAction("Limpiar caché…")
         # Acción contextual: generar nodo de programación C++ desde variable cuando el lenguaje activo es C++
         if is_variable_selected:
             try:
@@ -2231,6 +2917,11 @@ class NodeView(QGraphicsView):
                         self.centerOn(out_node)
                     except Exception:
                         pass
+            elif text == "Limpiar caché…":
+                try:
+                    self._clear_node_cache()
+                except Exception:
+                    logger.exception("No se pudo limpiar caché desde menú")
             elif text == "Generar nodo C++ (plantilla)":
                 # Crear un nodo semántico basado en C++ y la variable seleccionada
                 var_node_list = [it for it in self._scene.selectedItems() if isinstance(it, VariableNode)]
@@ -2399,6 +3090,48 @@ class NodeView(QGraphicsView):
                 pass
         except Exception:
             logger.exception("Error en duplicación rápida de nodo")
+
+    # ----------------------
+    # Cache helpers
+    # ----------------------
+    def _get_cache_dir(self) -> str:
+        try:
+            base = QStandardPaths.writableLocation(QStandardPaths.AppDataLocation)
+            if not base:
+                base = os.path.join(os.getcwd(), "cache")
+            cache_dir = os.path.join(base, "Codemind-Visual", "NodeCache")
+            os.makedirs(cache_dir, exist_ok=True)
+            return cache_dir
+        except Exception:
+            fallback = os.path.join(os.getcwd(), "cache")
+            os.makedirs(fallback, exist_ok=True)
+            return fallback
+
+    def _clear_node_cache(self) -> None:
+        """Vacía el directorio de caché y limpia referencias en nodos."""
+        try:
+            cache_dir = self._get_cache_dir()
+            if os.path.isdir(cache_dir):
+                for entry in os.listdir(cache_dir):
+                    p = os.path.join(cache_dir, entry)
+                    try:
+                        if os.path.isdir(p):
+                            shutil.rmtree(p, ignore_errors=True)
+                        else:
+                            os.remove(p)
+                    except Exception:
+                        pass
+            # Limpiar cache_path en nodos
+            for it in self._scene.items():
+                if isinstance(it, NodeItem):
+                    try:
+                        if hasattr(it, 'cache_path'):
+                            setattr(it, 'cache_path', None)
+                    except Exception:
+                        pass
+            logger.info("Caché limpiado: %s", cache_dir)
+        except Exception:
+            logger.exception("Error limpiando caché")
 
     # ----------------------
     # Node helpers
@@ -2968,7 +3701,19 @@ class NodeView(QGraphicsView):
         self.setTransformationAnchor(old_anchor)
         self._zoom = 0
         try:
-            self.zoomChanged.emit(float(self.transform().m11()))
+            scale_x = float(self.transform().m11())
+            self.zoomChanged.emit(scale_x)
+        except Exception:
+            pass
+        # Reaplicar hints acordes al nuevo ajuste
+        try:
+            self._apply_dynamic_render_hints(scale_x)
+            try:
+                for it in self._scene.items():
+                    if isinstance(it, NodeItem):
+                        it.apply_adaptive_text_behavior(scale_x)
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -3127,6 +3872,11 @@ class NodeView(QGraphicsView):
                     self.zoomChanged.emit(float(self.transform().m11()))
                 except Exception:
                     pass
+                # Ajustar hints tras auto-encuadre
+                try:
+                    self._apply_dynamic_render_hints(float(self.transform().m11()))
+                except Exception:
+                    pass
         except Exception:
             pass
         try:
@@ -3140,7 +3890,18 @@ class NodeView(QGraphicsView):
     def dragEnterEvent(self, event):
         try:
             md = event.mimeData()
-            if md.hasUrls() or md.hasText():
+            if md.hasUrls() or md.hasText() or md.hasFormat("text/uri-list") or md.hasFormat("application/x-qabstractitemmodeldatalist"):
+                event.acceptProposedAction()
+                return
+        except Exception:
+            pass
+        event.ignore()
+
+    def dragMoveEvent(self, event):
+        """Asegura aceptación durante el movimiento para permitir el drop."""
+        try:
+            md = event.mimeData()
+            if md.hasUrls() or md.hasText() or md.hasFormat("text/uri-list") or md.hasFormat("application/x-qabstractitemmodeldatalist"):
                 event.acceptProposedAction()
                 return
         except Exception:
@@ -3163,15 +3924,95 @@ class NodeView(QGraphicsView):
                             file_paths.append(local)
                     except Exception:
                         pass
-            elif md.hasText():
-                file_paths.append(md.text())
-            for i, path in enumerate(file_paths):
-                x = scene_pos.x() + i * 20.0
-                y = scene_pos.y() + i * 14.0
-                title = f"Archivo: {os.path.basename(path)}"
+            # Algunos views (como QTreeView+QFileSystemModel) emiten text/uri-list
+            if not file_paths and md.hasFormat("text/uri-list"):
                 try:
-                    node = self.add_node(title, x, y, node_type="file", content=path)
+                    raw = bytes(md.data("text/uri-list")).decode("utf-8", errors="replace")
+                    for line in raw.splitlines():
+                        line = line.strip()
+                        if line and not line.startswith("#"):
+                            # Convertir file:/// a ruta local
+                            if line.startswith("file:///"):
+                                local = line.replace("file:///", "")
+                                file_paths.append(local)
+                            else:
+                                file_paths.append(line)
+                except Exception:
+                    pass
+            elif not file_paths and md.hasText():
+                file_paths.append(md.text())
+            # Mapeo simple de extensiones a tipo de nodo
+            def _node_type_for(ext: str) -> str:
+                ext = ext.lower()
+                if ext in (".txt", ".md", ".log"):
+                    return "text"
+                if ext in (".py",):
+                    return "python"
+                if ext in (".cpp", ".cc", ".c", ".hpp", ".h"):
+                    return "cpp"
+                if ext in (".json", ".yaml", ".yml", ".toml"):
+                    return "config"
+                if ext in (".csv", ".tsv"):
+                    return "table"
+                return "file"
+
+            # Deduplicar rutas preservando el orden
+            seen = set()
+            uniq_paths = []
+            for p in file_paths:
+                np = os.path.normpath(p)
+                if np not in seen:
+                    seen.add(np)
+                    uniq_paths.append(np)
+
+            for i, path in enumerate(uniq_paths):
+                try:
+                    x = scene_pos.x() + i * 20.0
+                    y = scene_pos.y() + i * 14.0
+                    base = os.path.basename(path)
+                    title = base
+                    ext = os.path.splitext(base)[1]
+                    ntype = _node_type_for(ext)
+                    # Intentar cargar contenido para tipos de texto/código
+                    content = path
+                    if ntype in ("text", "python", "cpp", "config", "table"):
+                        try:
+                            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                                content = f.read()
+                        except Exception:
+                            content = path  # si falla, al menos conservar la ruta
+                    node = self.add_node(title, x, y, node_type=ntype, content=content)
                     if node:
+                        # Guardar referencia a la ruta fuente (sin romper el modelo)
+                        try:
+                            setattr(node, "source_path", path)
+                        except Exception:
+                            pass
+                        # Copiar al caché local para almacenamiento independiente
+                        try:
+                            cache_dir = QStandardPaths.writableLocation(QStandardPaths.AppDataLocation)
+                            if not cache_dir:
+                                cache_dir = os.path.join(os.getcwd(), "cache")
+                            cache_dir = os.path.join(cache_dir, "Codemind-Visual", "NodeCache")
+                            os.makedirs(cache_dir, exist_ok=True)
+                            # Nombre con hash para evitar colisiones
+                            try:
+                                stat = os.stat(path)
+                                payload = f"{path}|{stat.st_mtime}|{stat.st_size}".encode("utf-8", errors="ignore")
+                            except Exception:
+                                payload = path.encode("utf-8", errors="ignore")
+                            digest = hashlib.sha1(payload).hexdigest()[:12]
+                            name, ext2 = os.path.splitext(base)
+                            cached_name = f"{name}.{digest}{ext2}"
+                            dst = os.path.join(cache_dir, cached_name)
+                            if not os.path.exists(dst):
+                                shutil.copy2(path, dst)
+                            try:
+                                setattr(node, "cache_path", dst)
+                            except Exception:
+                                pass
+                        except Exception:
+                            pass
                         node.setSelected(True)
                 except Exception:
                     pass

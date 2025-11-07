@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Optional
 
 from PySide6 import QtCore, QtGui, QtWidgets
+from ..ui.app_icons import make_hat_icon, make_hat_icon_neon, make_top_hat_icon
 from ..graph.node_item import NodeItem
 from .blueprint_editor_window import BlueprintEditorWindow
 from .node_content_editor_window import NodeContentEditorWindow
@@ -63,6 +64,11 @@ class EditorWindow(QtWidgets.QMainWindow):
         super().__init__(parent)
 
         self.setWindowTitle("Editor de Texto y Nodos")
+        try:
+            # Sombrero de copa negro (chistera), elegante y sobrio
+            self.setWindowIcon(make_top_hat_icon(128))
+        except Exception:
+            pass
         self.resize(1200, 800)
 
         # Estado sidebar
@@ -97,16 +103,11 @@ class EditorWindow(QtWidgets.QMainWindow):
             pass
         self.outer_splitter.addWidget(self.file_explorer)
 
-        # Panel de trabajo a la derecha (tabs simples: Editor y NodeView)
+        # Panel de trabajo a la derecha (solo NodeView)
         self.work_tabs = QtWidgets.QTabWidget(self)
         self.work_tabs.setDocumentMode(True)
         self.work_tabs.setTabPosition(QtWidgets.QTabWidget.North)
         self.outer_splitter.addWidget(self.work_tabs)
-
-        # Editor de texto básico
-        self.text_editor = QtWidgets.QPlainTextEdit(self)
-        self.text_editor.setPlaceholderText("Editor de texto")
-        self.work_tabs.addTab(self.text_editor, "Editor")
 
         # NodeView o placeholder dentro de un contenedor con barra inferior propia
         self.node_view = _load_node_view(self)
@@ -126,6 +127,15 @@ class EditorWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
 
+        # Seleccionar la pestaña de Nodos por defecto
+        try:
+            for i in range(self.work_tabs.count()):
+                if self.work_tabs.widget(i) is self.node_tab:
+                    self.work_tabs.setCurrentIndex(i)
+                    break
+        except Exception:
+            pass
+
         # Central widget
         self.setCentralWidget(central)
         try:
@@ -137,6 +147,14 @@ class EditorWindow(QtWidgets.QMainWindow):
         self._setup_status_bar()
         # Conectar la barra inferior del editor de nodos después de crear NodeView
         QtCore.QTimer.singleShot(0, self._wire_node_bottom_bar)
+
+        # Asegurar demo de nodos al iniciar (ya que no hay cambio de pestaña)
+        try:
+            QtCore.QTimer.singleShot(0, lambda: (
+                hasattr(self.node_view, 'ensure_demo_graph') and self.node_view.ensure_demo_graph()
+            ))
+        except Exception:
+            pass
 
         # Restaurar estado del sidebar
         self._restore_sidebar_state()

@@ -58,7 +58,7 @@ class GraphRuntime:
         # Reiniciar inputs en nodos Output para evitar duplicados entre evaluaciones
         try:
             for n in nodes:
-                if str(getattr(n, 'node_type', '')).lower() == 'output':
+                if str(getattr(n, 'node_type', '')).lower() in ('output', 'group_output'):
                     setattr(n, 'input_values', {})
         except Exception:
             pass
@@ -109,10 +109,10 @@ class GraphRuntime:
                 break
             last_inputs = current_inputs
 
-        # Post-procesado: permitir que nodos de tipo "output" reflejen valores combinados
+        # Post-procesado: permitir que nodos de tipo "output"/"group_output" reflejen valores combinados
         for n in nodes:
             try:
-                if str(getattr(n, 'node_type', '')).lower() == 'output':
+                if str(getattr(n, 'node_type', '')).lower() in ('output', 'group_output'):
                     # Si es snapshot, nunca sobrescribir su contenido
                     try:
                         if getattr(n, 'is_snapshot', False):

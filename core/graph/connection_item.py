@@ -1,5 +1,5 @@
 from PySide6.QtWidgets import QGraphicsPathItem, QGraphicsItem
-from PySide6.QtGui import QPen, QColor, QPainterPath, QBrush, QLinearGradient
+from PySide6.QtGui import QPen, QColor, QPainterPath, QBrush, QLinearGradient, QRadialGradient
 from PySide6.QtCore import QPointF, QRectF, Qt
 import math
 from .connection_logic import get_logic
@@ -64,6 +64,11 @@ class ConnectionItem(QGraphicsPathItem):
         self._shimmer_speed = 2.2
 
         self.update_path()
+        # Cache en coordenadas de dispositivo para mantener líneas nítidas al zoom
+        try:
+            self.setCacheMode(QGraphicsItem.DeviceCoordinateCache)
+        except Exception:
+            pass
 
     # --- Lógica de combinación aplicada en runtime ---
     def apply_logic(self, prev_value, incoming_value):
@@ -178,6 +183,11 @@ class ConnectionItem(QGraphicsPathItem):
         """Pinta la conexión con estilo limpio y neón con animación sutil."""
         if self.path().isEmpty():
             return
+        try:
+            painter.setRenderHint(painter.Antialiasing, True)
+            painter.setRenderHint(painter.HighQualityAntialiasing, True)
+        except Exception:
+            pass
 
         path = self.path()
         start_pos = path.pointAtPercent(0)
@@ -259,10 +269,21 @@ class ConnectionItem(QGraphicsPathItem):
             painter.drawPath(path)
             painter.restore()
 
-        painter.save()
-        painter.setPen(Qt.NoPen)
-        # Estilo profesional: sin destello viajero para evitar distracción
-        painter.restore()
+        # Destello viajero: punto brillante que recorre la curva
+        try:
+            painter.save()
+            pt = path.pointAtPercent(self._anim_t % 1.0)
+            radius = 6.0
+            glow_grad = QRadialGradient(pt, radius)
+            glow_col = QColor(neon_color.red(), neon_color.green(), neon_color.blue(), 220)
+            glow_grad.setColorAt(0.0, glow_col)
+            glow_grad.setColorAt(1.0, QColor(neon_color.red(), neon_color.green(), neon_color.blue(), 0))
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QBrush(glow_grad))
+            painter.drawEllipse(QRectF(pt.x() - radius, pt.y() - radius, radius * 2, radius * 2))
+            painter.restore()
+        except Exception:
+            pass
 
     def tick_animation(self):
         """Avanza el estado de animación y solicita repintado."""

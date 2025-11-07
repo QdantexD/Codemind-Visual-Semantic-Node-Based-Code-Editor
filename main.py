@@ -2,7 +2,8 @@ import sys
 import os
 import logging
 import traceback
-from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtWidgets import QApplication
+from PySide6.QtGui import QIcon
 #Creador Eddi Andreé Salazar Matos#
 #Github: https://github.com/QdantexD#
 
@@ -10,10 +11,17 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 # Imports de core usando el paquete
 # -----------------------------
 try:
-    from core.app.editor_window import EditorWindow
-    from core.app.node_view_adapter import MyNodeGraphController
+    # Importaciones limpias desde la fachada 'core'
+    from core import EditorWindow, MyNodeGraphController
+    from core.ui.app_icons import make_hat_icon, make_hat_icon_neon, make_top_hat_icon
+    from core.ui.app_icons_export import ensure_app_icon_assets
     from core.library.cpp_bibliotecas_generator import generate_all_cpp_bibliotecas
-    logging.basicConfig(level=logging.INFO)
+    # Logging con formato consistente
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
     logger = logging.getLogger(__name__)
 except ImportError as e:
     print(f"Error al importar módulos: {e}")
@@ -23,9 +31,33 @@ def main():
     """Función principal de la aplicación."""
     try:
         app = QApplication(sys.argv)
-        app.setApplicationName("Editor de Texto y Nodos")
+        # Establecer un AppUserModelID explícito para que Windows use el icono del EXE
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("CodemindEditor.Codemind")
+        except Exception:
+            pass
+        # Alinear QSettings/AppName con EditorWindow para persistencia coherente
+        try:
+            app.setOrganizationName(getattr(EditorWindow, "ORGANIZATION", "Codemind-Visual"))
+            app.setApplicationName(getattr(EditorWindow, "APP_NAME", "Semantic-Node-Editor"))
+        except Exception:
+            app.setApplicationName("Editor de Texto y Nodos")
         app.setApplicationVersion("1.0")
         
+        # Generar assets del icono y usar .ico si está disponible
+        try:
+            ico_path = ensure_app_icon_assets()
+            if ico_path.exists():
+                app.setWindowIcon(QIcon(str(ico_path)))
+            else:
+                app.setWindowIcon(make_top_hat_icon(128))
+        except Exception:
+            try:
+                app.setWindowIcon(make_top_hat_icon(128))
+            except Exception:
+                pass
+
         # Generar archivos de Bibliotecas C++ para facilitar conexiones de variables
         try:
             out_dir = generate_all_cpp_bibliotecas()
@@ -41,6 +73,8 @@ def main():
         controller = MyNodeGraphController()
         window.set_node_controller(controller)
         
+        # Ya se estableció el icono global antes; mantener así para Taskbar.
+
         window.show()
         
         return app.exec()

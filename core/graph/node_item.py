@@ -140,13 +140,19 @@ class NodeItem(QGraphicsRectItem):
         self.setFlags(
             QGraphicsItem.ItemIsSelectable |
             QGraphicsItem.ItemIsMovable |
-            QGraphicsItem.ItemSendsGeometryChanges |
-            QGraphicsItem.ItemClipsChildrenToShape
+            QGraphicsItem.ItemSendsGeometryChanges
         )
+        # No recortar hijos al shape del nodo: evita que el título nítido
+        # sea truncado visualmente cuando el zoom hace que el rect se vea más pequeño.
+        try:
+            self.setFlag(QGraphicsItem.ItemClipsChildrenToShape, False)
+        except Exception:
+            pass
         self.setAcceptHoverEvents(True)
         # Caché de item para mejorar estabilidad del render al hacer zoom/pan
         try:
-            self.setCacheMode(QGraphicsItem.ItemCoordinateCache)
+            # Cache en coordenadas de dispositivo: nítido al cambiar zoom
+            self.setCacheMode(QGraphicsItem.DeviceCoordinateCache)
         except Exception:
             pass
         
@@ -170,6 +176,9 @@ class NodeItem(QGraphicsRectItem):
         self._hovered = False
         self._editing = False
         self.id = str(id(self))  # ID único para el nodo
+
+        # Ícono opcional en el encabezado (establecido por la vista)
+        self.header_icon = None
 
         # Padding del área de contenido para evitar solaparse con etiquetas de puertos
         self._content_padding_left = 56
@@ -196,6 +205,8 @@ class NodeItem(QGraphicsRectItem):
         self._selected_border_color = QColor("#f59e0b") # borde seleccionado (ámbar)
         self._title_bg_color = QColor("#1b1e24")        # barra de título
         self._title_text_color = QColor("#e6e8ea")      # texto de título
+        # Diagnóstico: última escala de vista observada
+        self._debug_last_view_scale = None
 
         # Título (editable)
         self.title_item = QGraphicsTextItem(self)
@@ -212,11 +223,11 @@ class NodeItem(QGraphicsRectItem):
             pass
         self.title_item.setFont(f)
         self.title_item.setTextInteractionFlags(Qt.NoTextInteraction)
-        # Hacer que el título escale con el zoom para evitar textos gigantes
+        # Mantener texto del título nítido sin escalar con el zoom
         try:
-            self.title_item.setFlag(QGraphicsItem.ItemIgnoresTransformations, False)
-            # Recortar el texto al shape del nodo para evitar desbordes
-            self.title_item.setFlag(QGraphicsItem.ItemClipsToShape, True)
+            self.title_item.setFlag(QGraphicsItem.ItemIgnoresTransformations, True)
+            # No recortar el título al shape: mantenerlo centrado sin agrandar
+            self.title_item.setFlag(QGraphicsItem.ItemClipsToShape, False)
         except Exception:
             pass
         # Evitar foco para que no aparezcan rectángulos de selección/resaltado
@@ -245,13 +256,13 @@ class NodeItem(QGraphicsRectItem):
         self.content_item.setFlag(QGraphicsItem.ItemIsFocusable, False)
         # Texto nítido sin escalar con el zoom
         try:
-            # Mantener el texto contenido dentro del nodo en cualquier zoom
-            self.content_item.setFlag(QGraphicsItem.ItemIgnoresTransformations, False)
+            # Texto de contenido nítido: no escalar con el zoom
+            self.content_item.setFlag(QGraphicsItem.ItemIgnoresTransformations, True)
         except Exception:
             pass
-        # Mantener oculto en modo vista; se usa para medir alto del documento
+        # Mostrar el contenido en modo vista (no edición) para reflejar cambios en vivo
         try:
-            self.content_item.setVisible(False)
+            self.content_item.setVisible(True)
         except Exception:
             pass
         self._update_content_layout()
@@ -485,14 +496,91 @@ class NodeItem(QGraphicsRectItem):
             self.add_output_port("output")
         self.update()
 
+    # -----------------------------
+    # Adaptación de texto al zoom
+    # -----------------------------
+    def apply_adaptive_text_behavior(self, scale_x: float) -> None:
+        """Alterna si el texto ignora transformaciones según el zoom.
+
+        - En zoom normal/alto (>= 0.9) mantiene texto estático y nítido.
+        - Al alejarse (< 0.9) permite que el título se reduzca con el nodo
+          para evitar que domine la vista.
+        """
+        try:
+            enable_ignore = float(scale_x) >= 0.9
+        except Exception:
+            enable_ignore = True
+        try:
+            self.title_item.setFlag(QGraphicsItem.ItemIgnoresTransformations, enable_ignore)
+        except Exception:
+            pass
+        try:
+            self.content_item.setFlag(QGraphicsItem.ItemIgnoresTransformations, enable_ignore)
+        except Exception:
+            pass
+        try:
+            self._update_title_pos()
+            self._update_content_layout()
+        except Exception:
+            pass
+
     def paint(self, painter: QPainter, option, widget=None):
         """Pinta el nodo con un estilo más elegante al estilo Nuke/Houdini."""
-        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        try:
+            painter.setRenderHint(QPainter.HighQualityAntialiasing, True)
+        except Exception:
+            pass
+        painter.setRenderHint(QPainter.TextAntialiasing, True)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
         rect = self.rect()
         # Nivel de detalle basado en zoom para decidir etiquetas visibles
         lod = 1.0
         try:
-            lod = float(option.levelOfDetailFromTransform(self.sceneTransform()))
+            # Usar la transformada mundial del pintor: refleja el zoom real de la vista
+            from PySide6.QtWidgets import QStyleOptionGraphicsItem
+            lod = float(QStyleOptionGraphicsItem.levelOfDetailFromTransform(painter.worldTransform()))
+        except Exception:
+            try:
+                # Fallback a la transformada de escena si el mundo no está disponible
+                from PySide6.QtWidgets import QStyleOptionGraphicsItem
+                lod = float(QStyleOptionGraphicsItem.levelOfDetailFromTransform(self.sceneTransform()))
+            except Exception:
+                pass
+
+        # Escala real del QGraphicsView (más fiable para zoom)
+        view_scale = 1.0
+        try:
+            sc = self.scene()
+            if sc is not None:
+                views = sc.views()
+                if views:
+                    t = views[0].transform()
+                    sx = float(t.m11())
+                    sy = float(t.m22())
+                    view_scale = (sx + sy) / 2.0 if (sx > 0 and sy > 0) else max(sx, sy)
+        except Exception:
+            pass
+        # Detectar si el viewport es OpenGL para condicionar elementos visuales
+        gl_active = False
+        try:
+            sc = self.scene()
+            if sc is not None:
+                views = sc.views()
+                if views:
+                    vp = views[0].viewport()
+                    try:
+                        from PySide6.QtOpenGLWidgets import QOpenGLWidget
+                        gl_active = isinstance(vp, QOpenGLWidget)
+                    except Exception:
+                        gl_active = False
+        except Exception:
+            pass
+        # Log de diagnóstico al cambiar significativamente
+        try:
+            if self._debug_last_view_scale is None or abs(self._debug_last_view_scale - view_scale) > 0.05:
+                print(f"[NodeItem] view_scale={view_scale:.3f} lod={lod:.3f}")
+                self._debug_last_view_scale = view_scale
         except Exception:
             pass
 
@@ -556,28 +644,7 @@ class NodeItem(QGraphicsRectItem):
                 # Línea de brillo superior muy tenue
                 painter.setPen(QPen(QColor(180, 190, 200, 24), 1))
                 painter.drawLine(content_rect.topLeft() + QPointF(2, 1), content_rect.topRight() + QPointF(-2, 1))
-                # Render del contenido en modo vista: texto con clipping y escala por zoom
-                try:
-                    painter.save()
-                    clip = content_rect.adjusted(2, 2, -2, -2)
-                    painter.setClipRect(clip)
-                    base_size = 10
-                    size = int(max(7, min(13, base_size * max(0.6, min(1.3, lod)))))
-                    try:
-                        font = QFont("Consolas", size)
-                    except Exception:
-                        font = QFont("Courier New", size)
-                    painter.setFont(font)
-                    painter.setPen(QPen(QColor("#e5e7eb"), 1))
-                    # Dibujo con word-wrap dentro del rectángulo de contenido
-                    painter.drawText(clip, Qt.TextWordWrap | Qt.AlignLeft | Qt.AlignTop, getattr(self, 'content', '') or '')
-                except Exception:
-                    pass
-                finally:
-                    try:
-                        painter.restore()
-                    except Exception:
-                        pass
+                # El texto se dibuja con content_item (nítido, sin escalado). No duplicar aquí.
         except Exception:
             pass
 
@@ -616,9 +683,38 @@ class NodeItem(QGraphicsRectItem):
         painter.setPen(Qt.NoPen)
         painter.setBrush(QBrush(grad))
         painter.drawRoundedRect(title_rect, min(self.radius, self.title_h / 2), min(self.radius, self.title_h / 2))
-        # Acento superior fino
-        painter.setPen(QPen(QColor("#3b82f6" if not self.isSelected() else "#f59e0b"), 2))
+        # Acento superior fino con identidad por lenguaje
+        try:
+            lang = str(getattr(self, "_language", "") or "").lower()
+        except Exception:
+            lang = ""
+        brand = QColor("#3b82f6")
+        if "python" in lang:
+            brand = QColor("#22c55e")  # verde agua para Python
+        elif "cpp" in lang or "c++" in lang:
+            brand = QColor("#60a5fa")  # azul para C++
+        elif "javascript" in lang or "js" in lang:
+            brand = QColor("#f59e0b")  # ámbar para JS
+        accent = QColor("#f59e0b") if self.isSelected() else brand
+        painter.setPen(QPen(accent, 2))
         painter.drawLine(title_rect.topLeft() + QPointF(2, 1), title_rect.topRight() + QPointF(-2, 1))
+
+        # Ícono del encabezado (si está definido), alineado a la izquierda, nítido en cualquier zoom
+        try:
+            if getattr(self, "header_icon", None):
+                size = 22
+                s = view_scale if view_scale > 0.001 else 1.0
+                painter.save()
+                # Evitar suavizado que produce borrosidad del pixmap
+                painter.setRenderHint(QPainter.SmoothPixmapTransform, False)
+                pm = self.header_icon.pixmap(int(size), int(size))
+                x = (title_rect.left() + 6) * s
+                y = (title_rect.top() + (self.title_h - size) / 2) * s
+                painter.scale(1.0 / s, 1.0 / s)
+                painter.drawPixmap(QPointF(x, y), pm)
+                painter.restore()
+        except Exception:
+            pass
 
         # Separador
         painter.setPen(QPen(QColor("#1f2937"), 1))
@@ -691,25 +787,26 @@ class NodeItem(QGraphicsRectItem):
                 painter.setPen(Qt.NoPen)
                 painter.setBrush(QBrush(glow_color))
                 painter.drawEllipse(glow)
-            # Badge de cantidad de conexiones (IN)
+            # Contador de conexiones (IN) en tamaño fijo: solo texto, sin círculo
             try:
                 if in_conn_count > 0:
-                    badge_r = 9
-                    badge_rect = QRectF(center.x() - badge_r, center.y() - 18, badge_r * 2, badge_r * 2)
-                    painter.setPen(QPen(badge_border, 1))
-                    painter.setBrush(QBrush(badge_fill))
-                    painter.drawEllipse(badge_rect)
+                    s = view_scale if view_scale > 0.001 else 1.0
+                    painter.save()
+                    painter.scale(1.0 / s, 1.0 / s)
+                    # Posicionamos el texto ligeramente arriba del pin
+                    text_rect = QRectF((center.x() - 10) * s, (center.y() - 18) * s, 20 * s, 18 * s)
                     painter.setPen(QPen(badge_text, 1))
-                    painter.setFont(QFont("Sans", 8, QFont.Bold))
-                    painter.drawText(badge_rect, Qt.AlignCenter, str(in_conn_count))
+                    painter.setFont(QFont("Sans", 9, QFont.Bold))
+                    painter.drawText(text_rect, Qt.AlignCenter, str(in_conn_count))
+                    painter.restore()
             except Exception:
                 pass
-            # Etiqueta con simetría respecto al pin
+            # Etiqueta/píldora solo cuando hay OpenGL activo
             try:
-                if lod >= 0.6:
+                if gl_active and lod >= 0.4:
                     name = port.get("name", "input")
-                    painter.setFont(QFont("Sans", 9, QFont.DemiBold))
-                    fm = painter.fontMetrics()
+                    base_font = QFont("Sans", 9, QFont.DemiBold)
+                    fm = QFontMetrics(base_font)
                     text_w = fm.horizontalAdvance(name)
                     text_h = fm.height()
                     pill_w = text_w + 2 * pill_pad_x
@@ -717,8 +814,11 @@ class NodeItem(QGraphicsRectItem):
                     baseline_y = y_pos + 2
                     top_y = baseline_y - fm.ascent() - pill_pad_y
                     left_x = center.x() + pin_gap
-                    bg_rect = QRectF(left_x, top_y, pill_w, pill_h)
+                    s = view_scale if view_scale > 0.001 else 1.0
+                    painter.save()
+                    painter.scale(1.0 / s, 1.0 / s)
                     from PySide6.QtGui import QLinearGradient
+                    bg_rect = QRectF(left_x * s, top_y * s, pill_w * s, pill_h * s)
                     grad_in = QLinearGradient(bg_rect.topLeft(), bg_rect.bottomLeft())
                     grad_in.setColorAt(0.0, pill_grad_top)
                     grad_in.setColorAt(1.0, pill_grad_bot)
@@ -727,7 +827,9 @@ class NodeItem(QGraphicsRectItem):
                     painter.drawRoundedRect(bg_rect, pill_radius, pill_radius)
                     # Texto
                     painter.setPen(QPen(text_color, 1))
-                    painter.drawText(QPointF(left_x + pill_pad_x, baseline_y), name)
+                    painter.setFont(base_font)
+                    painter.drawText(QPointF((left_x + pill_pad_x) * s, baseline_y * s), name)
+                    painter.restore()
             except Exception:
                 pass
 
@@ -784,25 +886,25 @@ class NodeItem(QGraphicsRectItem):
                 painter.setPen(Qt.NoPen)
                 painter.setBrush(QBrush(glow_color))
                 painter.drawEllipse(glow)
-            # Badge de cantidad de conexiones (OUT)
+            # Contador de conexiones (OUT) en tamaño fijo: solo texto, sin círculo
             try:
                 if out_conn_count > 0:
-                    badge_r = 9
-                    badge_rect = QRectF(center.x() - badge_r, center.y() - 18, badge_r * 2, badge_r * 2)
-                    painter.setPen(QPen(badge_border, 1))
-                    painter.setBrush(QBrush(badge_fill))
-                    painter.drawEllipse(badge_rect)
+                    s = view_scale if view_scale > 0.001 else 1.0
+                    painter.save()
+                    painter.scale(1.0 / s, 1.0 / s)
+                    text_rect = QRectF((center.x() - 10) * s, (center.y() - 18) * s, 20 * s, 18 * s)
                     painter.setPen(QPen(badge_text, 1))
-                    painter.setFont(QFont("Sans", 8, QFont.Bold))
-                    painter.drawText(badge_rect, Qt.AlignCenter, str(out_conn_count))
+                    painter.setFont(QFont("Sans", 9, QFont.Bold))
+                    painter.drawText(text_rect, Qt.AlignCenter, str(out_conn_count))
+                    painter.restore()
             except Exception:
                 pass
-            # Etiqueta con simetría respecto al pin
+            # Etiqueta/píldora solo cuando hay OpenGL activo
             try:
-                if lod >= 0.6:
+                if gl_active and lod >= 0.4:
                     name = port.get("name", "output")
-                    painter.setFont(QFont("Sans", 9, QFont.DemiBold))
-                    fm = painter.fontMetrics()
+                    base_font = QFont("Sans", 9, QFont.DemiBold)
+                    fm = QFontMetrics(base_font)
                     text_w = fm.horizontalAdvance(name)
                     text_h = fm.height()
                     pill_w = text_w + 2 * pill_pad_x
@@ -810,8 +912,11 @@ class NodeItem(QGraphicsRectItem):
                     baseline_y = y_pos + 2
                     top_y = baseline_y - fm.ascent() - pill_pad_y
                     right_edge = center.x() - pin_gap
-                    bg_rect = QRectF(right_edge - pill_w, top_y, pill_w, pill_h)
+                    s = view_scale if view_scale > 0.001 else 1.0
+                    painter.save()
+                    painter.scale(1.0 / s, 1.0 / s)
                     from PySide6.QtGui import QLinearGradient
+                    bg_rect = QRectF((right_edge - pill_w) * s, top_y * s, pill_w * s, pill_h * s)
                     grad_out = QLinearGradient(bg_rect.topLeft(), bg_rect.bottomLeft())
                     grad_out.setColorAt(0.0, pill_grad_top)
                     grad_out.setColorAt(1.0, pill_grad_bot)
@@ -820,7 +925,9 @@ class NodeItem(QGraphicsRectItem):
                     painter.drawRoundedRect(bg_rect, pill_radius, pill_radius)
                     # Texto
                     painter.setPen(QPen(text_color, 1))
-                    painter.drawText(QPointF(bg_rect.x() + pill_pad_x, baseline_y), name)
+                    painter.setFont(base_font)
+                    painter.drawText(QPointF(((right_edge - pill_w) + pill_pad_x) * s, baseline_y * s), name)
+                    painter.restore()
             except Exception:
                 pass
 
@@ -951,7 +1058,8 @@ class NodeItem(QGraphicsRectItem):
                 except Exception:
                     pass
                 # Mantener el contenido plano oculto (renderizado en paint)
-                self.content_item.setVisible(False)
+                # Mostrar contenido con QGraphicsTextItem para nitidez y clipping
+                self.content_item.setVisible(True)
                 self.content_item.setPlainText(self.content)
                 try:
                     # Evitar que el texto plano tome foco al salir de edición
@@ -1149,32 +1257,56 @@ class NodeItem(QGraphicsRectItem):
         """
         if not expr:
             return input_val
-        # Entorno muy restringido
-        safe_globals = {
-            '__builtins__': {
-                'len': len,
-                'str': str,
-                'int': int,
-                'float': float,
-                'bool': bool,
-            }
+        # Entorno muy restringido para evitar importaciones u operaciones peligrosas
+        safe_builtins = {
+            'len': len,
+            'str': str,
+            'int': int,
+            'float': float,
+            'bool': bool,
+            'abs': abs,
+            'min': min,
+            'max': max,
+            'sum': sum,
         }
-        safe_locals = {
-            'input': input_val
-        }
-        try:
-            return eval(expr, safe_globals, safe_locals)
-        except Exception:
-            # Fallback más útil: si hay contenido, concatenar a la entrada
+        safe_globals = {'__builtins__': safe_builtins}
+        safe_locals = {'input': input_val}
+        code = str(expr or "")
+        # Soporte ampliado: si parece bloque/función, usar exec y buscar 'process'/'transform'/'main' o variables 'output'/'result'.
+        is_block = ("\n" in code) or ("def " in code) or ("=" in code)
+        if is_block:
             try:
-                expr_text = str(expr or "")
+                exec(code, safe_globals, safe_locals)
+                for fn_name in ("process", "transform", "main"):
+                    fn = safe_locals.get(fn_name)
+                    if callable(fn):
+                        return fn(safe_locals.get('input'))
+                for var_name in ("output", "result", "res"):
+                    if var_name in safe_locals:
+                        return safe_locals[var_name]
+                # Intentar evaluar la última línea como expresión
+                lines = [ln for ln in code.splitlines() if ln.strip()]
+                if lines:
+                    last = lines[-1]
+                    try:
+                        return eval(last, safe_globals, safe_locals)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        # Expresión simple: eval directo con 'input'
+        try:
+            return eval(code, safe_globals, safe_locals)
+        except Exception:
+            # Fallback más útil: concatenar el texto al input para no perderlo
+            try:
+                expr_text = str(code or "")
                 base = "" if input_val is None else str(input_val)
                 if expr_text.strip():
                     sep = "\n" if base and not base.endswith("\n") else ""
                     return f"{base}{sep}{expr_text}"
             except Exception:
                 pass
-            # Si no hay contenido, devolver entrada sin cambios
             return input_val
 
     def compute_output_values(self) -> dict:
@@ -1215,7 +1347,7 @@ class NodeItem(QGraphicsRectItem):
         except Exception:
             pass
 
-        if node_type in ('generic', 'input'):
+        if node_type in ('generic', 'input', 'group_input'):
             # Preferir el atributo `content`, que se sincroniza en vivo durante la edición.
             # Si está vacío, caer a `to_plain_text()` (texto del render plano).
             try:
@@ -1306,7 +1438,7 @@ class NodeItem(QGraphicsRectItem):
                 result['output'] = combined
             return result
 
-        if node_type == 'output':
+        if node_type in ('output', 'group_output'):
             # Por defecto consume valores; si forward_output está activo, publica su contenido en OUT
             try:
                 if getattr(self, 'forward_output', False):

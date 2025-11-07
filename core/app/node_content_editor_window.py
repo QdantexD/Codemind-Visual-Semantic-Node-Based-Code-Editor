@@ -135,7 +135,7 @@ class NodeContentEditorWindow(QtWidgets.QMainWindow):
             if self._node is None:
                 return
             node_type = str(getattr(self._node, 'node_type', '')).lower()
-            if node_type != 'output':
+            if node_type not in ('output', 'group_output'):
                 return
             parts = []
             for p in (getattr(self._node, 'input_ports', []) or []):

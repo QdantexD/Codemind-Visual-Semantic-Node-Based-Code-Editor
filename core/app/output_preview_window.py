@@ -23,12 +23,31 @@ class OutputPreviewWindow(QtWidgets.QMainWindow):
         self.setAttribute(QtCore.Qt.WA_DeleteOnClose, True)
         self._node_view = node_view
 
-        # Tabs por cada nodo Output
+        # Tabs por cada nodo Output (cada pestaña contiene subpestañas: Realtime y Auto)
         self.tabs = QtWidgets.QTabWidget(self)
         self.setCentralWidget(self.tabs)
 
-        # Mapa: nodo -> editor
-        self._editors: Dict[NodeItem, TextEditor] = {}
+        # Barra de herramientas para control de modo Auto
+        self._toolbar = QtWidgets.QToolBar(self)
+        self._toolbar.setMovable(False)
+        self._toolbar.setFloatable(False)
+        self.addToolBar(QtCore.Qt.TopToolBarArea, self._toolbar)
+        act_process = QtGui.QAction("Procesar ahora", self)
+        act_process.triggered.connect(self._snapshot_all_outputs)
+        self._toolbar.addAction(act_process)
+        self._auto_follow = False
+        self._toggle_follow = QtGui.QAction("Auto (seguir)", self)
+        self._toggle_follow.setCheckable(True)
+        self._toggle_follow.toggled.connect(self._set_auto_follow)
+        self._toolbar.addAction(self._toggle_follow)
+        act_clear = QtGui.QAction("Limpiar Auto", self)
+        act_clear.triggered.connect(self._clear_auto_outputs)
+        self._toolbar.addAction(act_clear)
+
+        # Mapa: nodo -> { 'realtime': TextEditor, 'auto': TextEditor }
+        self._editors: Dict[NodeItem, Dict[str, TextEditor]] = {}
+        # Mapa: nodo -> widget contenedor de su pestaña superior
+        self._tab_widgets: Dict[NodeItem, QtWidgets.QWidget] = {}
 
         # Timer de refresco en vivo (fallback por si alguna señal no llega)
         self._live_timer = QtCore.QTimer(self)
@@ -51,7 +70,10 @@ class OutputPreviewWindow(QtWidgets.QMainWindow):
         try:
             scene = getattr(self._node_view, "_scene", None)
             items = list(scene.items()) if scene else []
-            return [it for it in items if isinstance(it, NodeItem) and str(getattr(it, 'node_type', '')).lower() == 'output']
+            return [
+                it for it in items
+                if isinstance(it, NodeItem) and str(getattr(it, 'node_type', '')).lower() in ('output', 'group_output')
+            ]
         except Exception:
             return []
 
@@ -63,27 +85,41 @@ class OutputPreviewWindow(QtWidgets.QMainWindow):
 
         # Eliminar pestañas de nodos que ya no existen
         for removed in existing_nodes - desired_nodes:
-            editor = self._editors.pop(removed, None)
-            if editor is not None:
-                # Buscar y quitar la pestaña correspondiente
+            self._editors.pop(removed, None)
+            w = self._tab_widgets.pop(removed, None)
+            if w is not None:
                 for i in range(self.tabs.count()):
-                    if self.tabs.widget(i) is editor:
+                    if self.tabs.widget(i) is w:
                         self.tabs.removeTab(i)
                         break
 
-        # Agregar pestañas nuevas
+        # Agregar pestañas nuevas (cada una con subpestañas Realtime/Auto)
         for node in desired_nodes - existing_nodes:
-            editor = TextEditor()
-            editor.setReadOnly(True)
-            editor.setPlaceholderText("Esperando evaluación del grafo…")
-            self._editors[node] = editor
+            container = QtWidgets.QWidget()
+            lay = QtWidgets.QVBoxLayout(container)
+            lay.setContentsMargins(0, 0, 0, 0)
+            lay.setSpacing(0)
+            mode_tabs = QtWidgets.QTabWidget(container)
+            lay.addWidget(mode_tabs)
+
+            rt = TextEditor()
+            rt.setReadOnly(True)
+            rt.setPlaceholderText("Esperando evaluación del grafo…")
+            au = TextEditor()
+            au.setReadOnly(True)
+            au.setPlaceholderText("Aún no procesado. Usa ‘Procesar ahora’.")
+            mode_tabs.addTab(rt, "Realtime")
+            mode_tabs.addTab(au, "Auto")
+            self._editors[node] = {"realtime": rt, "auto": au}
+            self._tab_widgets[node] = container
+
             title = str(getattr(node, 'title', 'Output') or 'Output')
-            self.tabs.addTab(editor, title)
+            self.tabs.addTab(container, title)
 
         # Actualizar títulos por si cambian
         for i in range(self.tabs.count()):
             w = self.tabs.widget(i)
-            node = next((n for n, ed in self._editors.items() if ed is w), None)
+            node = next((n for n, tw in self._tab_widgets.items() if w is tw), None)
             if node is not None:
                 self.tabs.setTabText(i, str(getattr(node, 'title', 'Output') or 'Output'))
 
@@ -106,7 +142,7 @@ class OutputPreviewWindow(QtWidgets.QMainWindow):
           que llegan a cada nodo Output.
         - Mantiene fallback al contenido del nodo cuando no hay entradas.
         """
-        for node, editor in list(self._editors.items()):
+        for node, editors in list(self._editors.items()):
             try:
                 parts = []
                 for p in (getattr(node, 'input_ports', []) or []):
@@ -129,12 +165,36 @@ class OutputPreviewWindow(QtWidgets.QMainWindow):
                         text = str(getattr(node, 'content', '') or '')
                 # Mostrar placeholder solo si está vacío y no hay nada que mostrar
                 if not text:
-                    editor.setPlaceholderText("Sin datos de entrada…")
-                editor.setPlainText(text)
+                    editors['realtime'].setPlaceholderText("Sin datos de entrada…")
+                editors['realtime'].setPlainText(text)
                 # Desplazar al final para ver cambios recientes
-                cur = editor.textCursor()
+                cur = editors['realtime'].textCursor()
                 cur.movePosition(QtGui.QTextCursor.End)
-                editor.setTextCursor(cur)
+                editors['realtime'].setTextCursor(cur)
+
+                # Modo Auto: actualizar solo si seguimiento activo
+                if getattr(self, '_auto_follow', False):
+                    editors['auto'].setPlainText(text)
+            except Exception:
+                pass
+
+    # ---- Utilidades de Auto ----
+    def _snapshot_all_outputs(self) -> None:
+        """Captura el estado actual de Realtime en todas las pestañas Auto."""
+        for node, editors in list(self._editors.items()):
+            try:
+                editors['auto'].setPlainText(editors['realtime'].toPlainText())
+            except Exception:
+                pass
+
+    def _set_auto_follow(self, enabled: bool) -> None:
+        self._auto_follow = bool(enabled)
+
+    def _clear_auto_outputs(self) -> None:
+        for node, editors in list(self._editors.items()):
+            try:
+                editors['auto'].clear()
+                editors['auto'].setPlaceholderText("Aún no procesado. Usa ‘Procesar ahora’.")
             except Exception:
                 pass
 
