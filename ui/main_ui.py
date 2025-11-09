@@ -18,6 +18,7 @@ GRAPH = Graph()
 REGISTRY = NodeRegistry()
 _NODE_COUNTER = 0
 _EDITOR_ID = None
+_WS_STATUS_ALIAS = "ws_status"
 
 
 def _set_text(item, value):
@@ -37,7 +38,7 @@ def start_ui():
     props_id = build_properties_panel()
 
     # Status labels from toolbar: use alias directly
-    ws_label = "ws_status"
+    ws_label = _WS_STATUS_ALIAS
     log_label = dpg.add_text("Waiting for messages...", parent=toolbar_id)
 
     # Register default node types
@@ -69,8 +70,14 @@ def _start_ws_client(ws_label, log_label):
                 while True:
                     try:
                         msg = await ws.recv()
-                        print("Server:", msg)
-                        _set_text(log_label, f"Server: {msg}")
+                        # Try JSON
+                        try:
+                            evt = json.loads(msg)
+                            _handle_server_event(evt)
+                            _set_text(log_label, f"Server evt: {evt.get('type')}")
+                        except Exception:
+                            print("Server:", msg)
+                            _set_text(log_label, f"Server: {msg}")
                     except Exception as e:
                         _set_text(ws_label, f"WS error: {e}")
                         break
@@ -94,6 +101,35 @@ def _send_graph_snapshot():
             print("WS send error:", e)
 
     threading.Thread(target=lambda: asyncio.run(run()), daemon=True).start()
+
+
+def _send_event(event_type: str, payload: dict):
+    data = {"type": event_type, "payload": payload}
+
+    async def run():
+        try:
+            async with websockets.connect(WS_URL) as ws:
+                await ws.send(json.dumps(data))
+        except Exception as e:
+            print("WS event send error:", e)
+
+    threading.Thread(target=lambda: asyncio.run(run()), daemon=True).start()
+
+
+def _handle_server_event(evt: dict):
+    t = evt.get("type")
+    payload = evt.get("payload", {})
+    if t == "node_update":
+        node_id = payload.get("id")
+        value = payload.get("value")
+        if node_id and value is not None:
+            try:
+                # Update node label to reflect value
+                node = GRAPH.nodes.get(node_id)
+                base_label = node.title if node else node_id
+                dpg.configure_item(node_id, label=f"{base_label} ({value})")
+            except Exception as e:
+                print("Label update error:", e)
 # --- Node registry and creation ---
 def _register_default_node_types():
     REGISTRY.register(NodeType("Compute", inputs=["in"], outputs=["out"], color="#66CCFF"))
@@ -121,6 +157,13 @@ def _create_node(type_name: str):
                 dpg.add_text(outp)
 
     GRAPH.add_node(Node(id=node_id, type=nt.name, title=nt.name, inputs=nt.inputs, outputs=nt.outputs, meta={"color": nt.color}))
+    # Send event: node_created
+    _send_event("node_created", {
+        "id": node_id,
+        "name": nt.name,
+        "inputs": nt.inputs,
+        "outputs": nt.outputs,
+    })
     _send_graph_snapshot()
 
 
@@ -134,6 +177,11 @@ def _on_link_created(sender, app_data):
         s_node, _, s_port = start_attr.split(":", 2)
         e_node, _, e_port = end_attr.split(":", 2)
         GRAPH.add_link(Link(start_node=s_node, start_port=s_port, end_node=e_node, end_port=e_port))
+        # Send event: link_created
+        _send_event("link_created", {
+            "from": {"node": s_node, "port": s_port},
+            "to": {"node": e_node, "port": e_port},
+        })
         _send_graph_snapshot()
     except Exception as e:
         print("Link create error:", e)
@@ -157,3 +205,16 @@ def _on_link_deleted(sender, app_data):
         _send_graph_snapshot()
     except Exception as e:
         print("Link delete error:", e)
+
+
+def _on_node_drag(sender, app_data):
+    try:
+        node_id = app_data
+        pos = dpg.get_item_pos(node_id)
+        # Update graph node meta
+        if node_id in GRAPH.nodes:
+            GRAPH.nodes[node_id].meta["pos"] = pos
+        # Send event: node_moved
+        _send_event("node_moved", {"id": node_id, "pos": list(pos)})
+    except Exception as e:
+        print("Node drag error:", e)
