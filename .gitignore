@@ -1,9 +1,0 @@
-__pycache__/
-*.pyc
-*.pyo
-*.swp
-.vscode/
-dist/
-build/
-*.egg-info/
-*.log
