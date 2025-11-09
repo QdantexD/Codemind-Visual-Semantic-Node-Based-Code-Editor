@@ -11,6 +11,7 @@ This package consolidates all user-facing documentation for Codemind Visual, v1.
 - Changelog: `changelog.md`
 - FAQ & Troubleshooting: `faq-troubleshooting.md`
 - Basic Architecture: `architecture.md`
+- Process API: `process-api.md`
 
 ## Scope
 - How to use the node-based editor, embedded terminal, and common flows.
