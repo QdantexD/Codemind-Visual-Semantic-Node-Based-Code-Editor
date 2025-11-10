@@ -43,11 +43,37 @@ def _set_text(item, value):
 
 def start_ui():
     dpg.create_context()
-    dpg.create_viewport(title="Omega-Visual", width=1200, height=800)
+    # Enable docking inside the viewport
+    try:
+        dpg.configure_app(docking=True, docking_space=True)
+    except Exception:
+        pass
+    dpg.create_viewport(title="Omega Visual Engine", width=1400, height=850)
     dpg.setup_dearpygui()
 
     # Apply global visual theme
     _build_global_theme()
+    try:
+        _font_set("Fira Code", size=14)
+    except Exception:
+        pass
+    # Root dockspace with menu bar as primary window
+    with dpg.window(label="Omega Visual Engine", tag="root_dock", pos=(0, 0), width=1400, height=850, menubar=True, no_move=True, no_resize=True, no_close=True) as _ROOT_ID:
+        with dpg.menu_bar():
+            with dpg.menu(label="File"):
+                dpg.add_menu_item(label="New Project", callback=lambda: _on_new_project())
+                dpg.add_menu_item(label="Open", callback=lambda: _on_open_project())
+                dpg.add_menu_item(label="Save All", callback=_on_save_pressed)
+                dpg.add_menu_item(label="Exit", callback=lambda: dpg.stop_dearpygui())
+            with dpg.menu(label="Window"):
+                dpg.add_menu_item(label="Toggle Outliner", callback=lambda: _toggle_outliner())
+                dpg.add_menu_item(label="Toggle Details", callback=lambda: _toggle_details())
+                dpg.add_menu_item(label="Toggle Output Log", callback=lambda: _toggle_log())
+                dpg.add_menu_item(label="Reset Layout", callback=lambda: _reset_layout())
+                dpg.add_menu_item(label="Dark Mode (Metal)", callback=lambda: _apply_metal_dark_theme())
+            with dpg.menu(label="Help"):
+                dpg.add_menu_item(label="About", callback=lambda: _show_about())
+    dpg.set_primary_window(_ROOT_ID, True)
 
     # Build windows
     toolbar_id = build_toolbar()
@@ -65,6 +91,18 @@ def start_ui():
     _PROPS_WIN_ID = props_id
     _EXPLORER_ID = explorer_id
     _TERMINAL_ID = terminal_id
+
+    # Apply per-window themes for panels
+    try:
+        # Viewport central lighter gray #2A2A2A
+        with dpg.theme() as _viewport_theme:
+            with dpg.theme_component(dpg.mvAll):
+                dpg.add_theme_color(dpg.mvThemeCol_WindowBg, (42, 42, 42, 255))
+                dpg.add_theme_style(dpg.mvStyleVar_WindowRounding, 2.0)
+                dpg.add_theme_style(dpg.mvStyleVar_ItemSpacing, 8.0, 8.0)
+        dpg.bind_item_theme(_MAIN_WIN_ID, _viewport_theme)
+    except Exception:
+        pass
 
     # Status labels from toolbar: use alias directly
     ws_label = _WS_STATUS_ALIAS
@@ -111,8 +149,7 @@ def start_ui():
 
     # Minimap desactivado: no crear overlay ni reconstruirlo
 
-    # Aplicar configuración estilo VS Code solicitada
-    _apply_vscode_like_configuration()
+    # UE5-style: skip VS Code configuration
 
     # Registrar callback de resize independiente del minimapa
     try:
@@ -179,21 +216,21 @@ def _build_global_theme():
     try:
         with dpg.theme() as theme_id:
             with dpg.theme_component(dpg.mvAll):
-                # Colors
-                # Dark+ (default dark) palette
-                dpg.add_theme_color(dpg.mvThemeCol_WindowBg, (30, 30, 30, 255))
-                dpg.add_theme_color(dpg.mvThemeCol_Text, (220, 220, 220, 255))
-                dpg.add_theme_color(dpg.mvThemeCol_FrameBg, (45, 45, 45, 255))
-                dpg.add_theme_color(dpg.mvThemeCol_FrameBgHovered, (60, 60, 60, 255))
-                dpg.add_theme_color(dpg.mvThemeCol_FrameBgActive, (70, 70, 70, 255))
-                # Accent #007acc
-                dpg.add_theme_color(dpg.mvThemeCol_Button, (0, 122, 204, 255))
-                dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (0, 132, 214, 255))
+                # Metallic dark theme
+                dpg.add_theme_color(dpg.mvThemeCol_WindowBg, (30, 30, 30, 255))  # #1E1E1E approx
+                dpg.add_theme_color(dpg.mvThemeCol_Text, (230, 230, 230, 255))   # #E6E6E6
+                dpg.add_theme_color(dpg.mvThemeCol_FrameBg, (45, 45, 45, 255))   # #2D2D2D
+                dpg.add_theme_color(dpg.mvThemeCol_FrameBgHovered, (55, 55, 55, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_FrameBgActive, (58, 58, 58, 255))
+                # Accent buttons / active border
+                dpg.add_theme_color(dpg.mvThemeCol_Button, (0, 122, 204, 255))   # #007ACC
+                dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (58, 155, 220, 255))  # #3A9BDC
                 dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (0, 102, 184, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_Border, (58, 155, 220, 200))
                 # Spacing & rounding
-                dpg.add_theme_style(dpg.mvStyleVar_WindowRounding, 8.0)
-                dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 6.0)
-                dpg.add_theme_style(dpg.mvStyleVar_ItemSpacing, 8.0, 6.0)
+                dpg.add_theme_style(dpg.mvStyleVar_WindowRounding, 2.0)
+                dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 2.0)
+                dpg.add_theme_style(dpg.mvStyleVar_ItemSpacing, 8.0, 8.0)
                 dpg.add_theme_style(dpg.mvStyleVar_WindowPadding, 8.0, 8.0)
         dpg.bind_theme(theme_id)
     except Exception as e:
@@ -430,6 +467,61 @@ def _on_node_selected(node_id: str):
         dpg.set_value("prop_outputs", f"Outputs: {', '.join(node.outputs)}")
         dpg.set_value("prop_hint", "")
     _rebuild_minimap()
+
+def _toggle_outliner():
+    try:
+        show = not dpg.is_item_shown(_EXPLORER_ID)
+        dpg.configure_item(_EXPLORER_ID, show=show)
+    except Exception:
+        pass
+
+
+def _toggle_details():
+    try:
+        show = not dpg.is_item_shown(_PROPS_WIN_ID)
+        dpg.configure_item(_PROPS_WIN_ID, show=show)
+    except Exception:
+        pass
+
+
+def _toggle_log():
+    try:
+        show = not dpg.is_item_shown(_TERMINAL_ID)
+        dpg.configure_item(_TERMINAL_ID, show=show)
+    except Exception:
+        pass
+
+
+def _apply_metal_dark_theme():
+    # Rebind global theme to ensure dark metal is active
+    _build_global_theme()
+
+
+def _reset_layout():
+    try:
+        _layout_apply_default()
+    except Exception as e:
+        print("Reset layout error:", e)
+
+
+def _show_about():
+    try:
+        with dpg.window(label="About", modal=True, no_resize=True, width=360, height=140) as _about_id:
+            dpg.add_text("Omega Visual Engine — Unreal Style Interface (v1.0)")
+            dpg.add_spacer(height=6)
+            dpg.add_text("Dear PyGui + Docking. Paneles acoplables y tema metálico oscuro.")
+            dpg.add_spacer(height=8)
+            dpg.add_button(label="Cerrar", callback=lambda: dpg.delete_item(_about_id))
+    except Exception:
+        pass
+
+
+def _on_new_project():
+    _set_text(_WS_STATUS_ALIAS, "WS: New Project (stub)")
+
+
+def _on_open_project():
+    _set_text(_WS_STATUS_ALIAS, "WS: Open (stub)")
 
 
 # --- Toolbar actions ---

@@ -6,7 +6,7 @@ from dearpygui import dearpygui as dpg
 
 
 def build_properties_panel() -> int:
-    with dpg.window(label="Properties", width=280, pos=(920, 60)) as win_id:
+    with dpg.window(label="Details", width=280, pos=(920, 60)) as win_id:
         dpg.add_text("Select a node to view properties", tag="prop_hint")
         dpg.add_separator()
         dpg.add_input_text(label="Title", tag="prop_title")
